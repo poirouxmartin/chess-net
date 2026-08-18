@@ -6,12 +6,17 @@ Self-play games produce (board, result-from-stm) pairs used to train the net.
 """
 
 import math
+import multiprocessing as mp
 import random
 
 import chess
 import torch
 
-from .nnue import NNUE, encode_batch, FEAT_KP768, KP768_FEAT_COUNT
+from .nnue import NNUE, encode_batch, FEAT_HALFKP, FEAT_KP768, HALFKP_FEAT_COUNT, KP768_FEAT_COUNT
+
+
+def _feat_id(feat_count):
+    return FEAT_HALFKP if feat_count == HALFKP_FEAT_COUNT else FEAT_KP768
 
 
 class MCTSNode:
@@ -57,7 +62,7 @@ def mcts(root_board, net, iterations, device):
         if not legal:
             value = -1.0  # leaf is checkmate against side to move
         else:
-            idx, mask = encode_batch([board], FEAT_KP768)
+            idx, mask = encode_batch([board], _feat_id(net.feat_count))
             with torch.no_grad():
                 logit = net(idx.to(device), mask.to(device)).item()
             value = 1.0 / (1.0 + math.exp(-logit))
@@ -112,7 +117,7 @@ def play_game(net, iterations, device, max_plies=400, temp=1.0, temp_drop=12):
     for b in history:
         stm = b.turn
         result = white_result if stm == chess.WHITE else -white_result
-        data.append((b, (result + 1.0) / 2.0))
+        data.append((b.fen(), (result + 1.0) / 2.0))
     return data
 
 
@@ -123,15 +128,36 @@ class AlphaTrainer:
         self.opt = torch.optim.Adam(self.net.parameters(), lr=1e-3)
 
     def self_play(self, games, iterations, mcts_workers=1):
+        """Self-play `games` games. With mcts_workers>1, play in parallel
+        subprocesses (each builds its own copy of the net)."""
+        if mcts_workers <= 1:
+            return self._serial_play(games, iterations)
+        state = {k: v.detach().cpu() for k, v in self.net.state_dict().items()}
+        ctx = mp.get_context("spawn")
+        sizes = [games // mcts_workers] * mcts_workers
+        for i in range(games % mcts_workers):
+            sizes[i] += 1
+        with ctx.Pool(mcts_workers) as pool:
+            results = pool.starmap(
+                _play_worker,
+                [
+                    (state, s, iterations, self.device, self.net.feat_count,
+                     self.net.fb.numel(), self.net.wo.in_features)
+                    for s in sizes
+                ],
+            )
+        return [item for r in results for item in r]
+
+    def _serial_play(self, games, iterations):
         data = []
         for _ in range(games):
             data.extend(play_game(self.net, iterations, self.device))
         return data
 
     def train(self, data, epochs=1, batch_size=1024):
-        boards = [b for b, _ in data]
+        boards = [chess.Board(fen) for fen, _ in data]
         labels = torch.tensor([y for _, y in data], dtype=torch.float32)
-        idx, mask = encode_batch(boards, FEAT_KP768)
+        idx, mask = encode_batch(boards, _feat_id(self.net.feat_count))
         n = len(data)
         for _ in range(epochs):
             perm = torch.randperm(n)
@@ -146,3 +172,14 @@ class AlphaTrainer:
                 loss.backward()
                 self.opt.step()
         return self.net
+
+
+def _play_worker(state, games, iterations, device, feat_count, l0, l1):
+    """Subprocess entry point for parallel self-play (Windows spawn-safe)."""
+    net = NNUE(feat_count, l0, l1)
+    net.load_state_dict(state)
+    net.eval().to(device)
+    data = []
+    for _ in range(games):
+        data.extend(play_game(net, iterations, device))
+    return data

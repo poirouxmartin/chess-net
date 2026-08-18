@@ -20,6 +20,7 @@ def main():
     ap.add_argument("--cycles", type=int, default=5)
     ap.add_argument("--games", type=int, default=40, help="self-play games per cycle")
     ap.add_argument("--mcts-iters", type=int, default=100)
+    ap.add_argument("--mcts-workers", type=int, default=1, help="parallel self-play subprocesses")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=1024)
     ap.add_argument("--feat", type=int, default=2, choices=[1, 2])
@@ -36,7 +37,7 @@ def main():
 
     for cycle in range(args.cycles):
         print(f"cycle {cycle + 1}/{args.cycles}: self-play {args.games} games...")
-        data = trainer.self_play(args.games, args.mcts_iters)
+        data = trainer.self_play(args.games, args.mcts_iters, mcts_workers=args.mcts_workers)
         trainer.train(data, epochs=args.epochs, batch_size=args.batch_size)
         trainer.net = trainer.net.cpu()
         torch.save(trainer.net.state_dict(), args.out)

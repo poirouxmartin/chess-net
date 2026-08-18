@@ -19,7 +19,8 @@ python/
     features.py     HalfKP / KP768 encoders aligned with the Rust engine
     csnn.py         CSNN binary format reader/writer
     nnue.py         NNUE module + supervised training + CSNN export
-    alpha.py        MCTS + self-play reinforcement learning
+    alpha.py        MCTS + self-play reinforcement learning (parallel workers)
+    gen_data.py     dataset generator (random or net self-play)
     export.py       checkpoint -> CSNN CLI
     train_nnue.py   supervised training CLI
     train_alpha.py  self-play RL training CLI
@@ -64,11 +65,19 @@ arrays `fw[feat_count*l0]`, `fb[l0]`, `w1[l1*l0]`, `b1[l1]`, `wo[l1]`,
 pip install -r python/requirements.txt
 
 # Supervised: dataset lines "<fen> <label>"
+python -m chessnet.gen_data --mode random --games 500 --out data.txt
 python -m chessnet.train_nnue --data data.txt --out model.pt --csnn net.csnn
 
-# Self-play RL (AlphaZero-style)
+# Self-play RL (AlphaZero-style), parallel self-play via --mcts-workers
 python -m chessnet.train_alpha --cycles 5 --games 40 --mcts-iters 100 \
-    --out model.pt --csnn net.csnn
+    --mcts-workers 4 --out model.pt --csnn net.csnn
+
+# Supervised data from an existing net's self-play (MCTS)
+python -m chessnet.gen_data --mode net --checkpoint model.pt --games 200 \
+    --mcts-iters 80 --workers 4 --out data.txt
+
+# Use HalfKP features instead of KP768 (engine: --feat 1)
+python -m chessnet.train_nnue --feat 1 --data data.txt --out model.pt --csnn net.csnn
 
 # Export an existing checkpoint
 python -m chessnet.export --checkpoint model.pt --out net.csnn

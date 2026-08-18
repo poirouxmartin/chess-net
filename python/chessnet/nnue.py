@@ -45,7 +45,10 @@ class NNUE(nn.Module):
     @torch.no_grad()
     def evaluate(self, board, stm=True):
         """Single-position logit from stm perspective (stm ignored for features)."""
-        feats = F.features_halfkp(board) if False else F.features_kp768(board)
+        if self.feat_count == HALFKP_FEAT_COUNT:
+            feats = F.features_halfkp(board)
+        else:
+            feats = F.features_kp768(board)
         idx = torch.tensor([feats], dtype=torch.long)
         mask = torch.ones(1, len(feats), dtype=torch.bool)
         return self.forward(idx, mask).item()
