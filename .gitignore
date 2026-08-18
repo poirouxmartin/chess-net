@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Trained models / data
+*.pt
+*.csnn
+*.pgn
+/data/
+*.bin
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp

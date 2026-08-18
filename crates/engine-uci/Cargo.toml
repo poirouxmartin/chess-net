@@ -1,0 +1,12 @@
+[package]
+name = "engine-uci"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "chess-net"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+nn = { path = "../nn" }
