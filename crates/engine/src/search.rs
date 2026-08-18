@@ -91,13 +91,13 @@ impl Searcher {
 
         for d in 1..=max_depth {
             let r = self.root_search(pos, d as i32, stop, eval);
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
             best = r.best;
             score = r.score;
             done = d as i32;
             pv = self.pv_table[0][..self.pv_len[0]].to_vec();
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             if (MATE - score).abs() <= 2 {
                 break;
             }
@@ -242,12 +242,32 @@ impl Searcher {
 
         for i in 0..moves.len {
             let m = moves.get(i);
+            // Late Move Reductions: cut depth for quiet moves searched late.
+            let reduction = if i > 0 && m.is_quiet() && !in_check && depth >= 3 {
+                if i >= 6 {
+                    2
+                } else if i >= 3 {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
             let undo = pos.make_move(m);
             self.key_hist.push(pos.key);
             let s = if i == 0 {
                 -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval)
             } else {
-                let s = -self.negamax(pos, depth - 1, -alpha0 - 1, -alpha0, ply + 1, stop, eval);
+                let s = -self.negamax(
+                    pos,
+                    depth - 1 - reduction,
+                    -alpha0 - 1,
+                    -alpha0,
+                    ply + 1,
+                    stop,
+                    eval,
+                );
                 if s > alpha0 && s < beta {
                     -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval)
                 } else {
