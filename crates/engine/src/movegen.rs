@@ -76,7 +76,7 @@ pub fn generate_legal(pos: &Position) -> MoveList {
         let sq = pop_lsb(&mut kb);
         if !pos.square_attacked(sq, them, occ_no_king) {
             let flags = if enemies & bit(sq) != 0 { FLAG_CAPTURE } else { FLAG_QUIET };
-            list.push(Move::new(k, sq, 0, flags));
+            list.push(Move::new(k, sq, 0, flags).with_piece(KING));
         }
     }
 
@@ -105,15 +105,15 @@ pub fn generate_legal(pos: &Position) -> MoveList {
                 if rank_of(ps) == promo_rank {
                     if on_line(ps) {
                         for p in [PROMO_QUEEN, PROMO_ROOK, PROMO_BISHOP, PROMO_KNIGHT] {
-                            list.push(Move::new(sq, ps, p, FLAG_PROMO));
+                            list.push(Move::new(sq, ps, p, FLAG_PROMO).with_piece(PAWN));
                         }
                     }
                 } else if on_line(ps) {
-                    list.push(Move::new(sq, ps, 0, FLAG_QUIET));
+                    list.push(Move::new(sq, ps, 0, FLAG_QUIET).with_piece(PAWN));
                     if rank_of(sq) == start_rank {
                         if let Some(ps2) = step_sq(ps, forward) {
                             if empty & bit(ps2) != 0 && on_line(ps2) {
-                                list.push(Move::new(sq, ps2, 0, FLAG_DOUBLE));
+                                list.push(Move::new(sq, ps2, 0, FLAG_DOUBLE).with_piece(PAWN));
                             }
                         }
                     }
@@ -128,10 +128,10 @@ pub fn generate_legal(pos: &Position) -> MoveList {
             if on_line(t) {
                 if rank_of(t) == promo_rank {
                     for p in [PROMO_QUEEN, PROMO_ROOK, PROMO_BISHOP, PROMO_KNIGHT] {
-                        list.push(Move::new(sq, t, p, FLAG_PROMO_CAPTURE));
+                        list.push(Move::new(sq, t, p, FLAG_PROMO_CAPTURE).with_piece(PAWN));
                     }
                 } else {
-                    list.push(Move::new(sq, t, 0, FLAG_CAPTURE));
+                    list.push(Move::new(sq, t, 0, FLAG_CAPTURE).with_piece(PAWN));
                 }
             }
         }
@@ -139,7 +139,7 @@ pub fn generate_legal(pos: &Position) -> MoveList {
         // En passant.
         if let Some(ep) = pos.ep {
             if pawn_attacks(us, sq) & bit(ep) != 0 {
-                let m = Move::new(sq, ep, 0, FLAG_EN_PASSANT);
+                let m = Move::new(sq, ep, 0, FLAG_EN_PASSANT).with_piece(PAWN);
                 if ep_legal(pos, m) {
                     list.push(m);
                 }
@@ -157,7 +157,7 @@ pub fn generate_legal(pos: &Position) -> MoveList {
         let mut tb = knight_attacks(sq) & targets;
         while tb != 0 {
             let t = pop_lsb(&mut tb);
-            push_simple(&mut list, sq, t, enemies);
+            push_simple(&mut list, sq, t, enemies, KNIGHT);
         }
     }
 
@@ -172,7 +172,7 @@ pub fn generate_legal(pos: &Position) -> MoveList {
             }
             while tb != 0 {
                 let t = pop_lsb(&mut tb);
-                push_simple(&mut list, sq, t, enemies);
+                push_simple(&mut list, sq, t, enemies, pt);
             }
         }
     }
@@ -202,6 +202,167 @@ pub fn generate_legal(pos: &Position) -> MoveList {
     list
 }
 
+/// Count legal moves without building a move list. Used by perft leaf nodes
+/// (bulk counting), which dominate the node budget.
+#[inline(always)]
+pub fn count_legal(pos: &Position) -> usize {
+    let us = pos.side;
+    let them = us ^ 1;
+    let k = pos.king_sq[us];
+    let occ = pos.occ;
+    let occ_no_king = occ & !bit(k);
+    let enemies = pos.pieces_of(them);
+    let empty = !occ;
+    let pinned = pos.pinned();
+    let checkers = pos.checkers();
+    let in_check = checkers != 0;
+    let double_check = checkers.count_ones() > 1;
+    let mut n = 0;
+
+    // ---- King moves ----
+    let mut kb = king_attacks(k) & (empty | enemies);
+    while kb != 0 {
+        let sq = pop_lsb(&mut kb);
+        if !pos.square_attacked(sq, them, occ_no_king) {
+            n += 1;
+        }
+    }
+
+    if double_check {
+        return n;
+    }
+
+    // ---- Castling ----
+    if !in_check {
+        n += count_castling(pos, occ, occ_no_king, them);
+    }
+
+    // ---- Pawns ----
+    let mut pb = pos.piece_bb(us, PAWN);
+    let forward: i32 = if us == WHITE { 8 } else { -8 };
+    let promo_rank: usize = if us == WHITE { 7 } else { 0 };
+    let start_rank: usize = if us == WHITE { 1 } else { 6 };
+    while pb != 0 {
+        let sq = pop_lsb(&mut pb);
+        let pinned_sq = pinned & bit(sq) != 0;
+        let on_line = |to: usize| !pinned_sq || line(k, sq) & bit(to) != 0;
+
+        if let Some(ps) = step_sq(sq, forward) {
+            if empty & bit(ps) != 0 {
+                if rank_of(ps) == promo_rank {
+                    if on_line(ps) {
+                        n += 4;
+                    }
+                } else if on_line(ps) {
+                    n += 1;
+                    if rank_of(sq) == start_rank {
+                        if let Some(ps2) = step_sq(ps, forward) {
+                            if empty & bit(ps2) != 0 && on_line(ps2) {
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cb = pawn_attacks(us, sq) & enemies;
+        while cb != 0 {
+            let t = pop_lsb(&mut cb);
+            if on_line(t) {
+                n += if rank_of(t) == promo_rank { 4 } else { 1 };
+            }
+        }
+
+        if let Some(ep) = pos.ep {
+            if pawn_attacks(us, sq) & bit(ep) != 0 {
+                let m = Move::new(sq, ep, 0, FLAG_EN_PASSANT).with_piece(PAWN);
+                if ep_legal(pos, m) {
+                    n += 1;
+                }
+            }
+        }
+    }
+
+    // ---- Knights ----
+    let mut kb = pos.piece_bb(us, KNIGHT);
+    while kb != 0 {
+        let sq = pop_lsb(&mut kb);
+        if pinned & bit(sq) != 0 {
+            continue;
+        }
+        n += (knight_attacks(sq) & (empty | enemies)).count_ones() as usize;
+    }
+
+    // ---- Bishops / rooks / queens ----
+    for pt in [BISHOP, ROOK, QUEEN] {
+        let mut sb = pos.piece_bb(us, pt);
+        while sb != 0 {
+            let sq = pop_lsb(&mut sb);
+            let mut tb = sliding_attacks(pt, sq, occ) & (empty | enemies);
+            if pinned & bit(sq) != 0 {
+                tb &= line(k, sq);
+            }
+            n += tb.count_ones() as usize;
+        }
+    }
+
+    // ---- Check filtering ----
+    if in_check {
+        // Re-count with the same filter generate_legal applies: keep moves that
+        // capture the checker, block the line, or are king moves (already in n
+        // separately). We cannot distinguish move types from raw bitboards, so
+        // reuse generate_legal for the rare in-check nodes.
+        return generate_legal(pos).len;
+    }
+
+    n
+}
+
+fn count_castling(pos: &Position, occ: u64, occ_no_king: u64, them: usize) -> usize {
+    let us = pos.side;
+    let (ks_empty, ks_king, ks_right) = if us == WHITE {
+        (bit(5) | bit(6), bit(4) | bit(5) | bit(6), CASTLE_WK)
+    } else {
+        (bit(61) | bit(62), bit(60) | bit(61) | bit(62), CASTLE_BK)
+    };
+    let (qs_empty, qs_king, qs_right) = if us == WHITE {
+        (bit(1) | bit(2) | bit(3), bit(2) | bit(3) | bit(4), CASTLE_WQ)
+    } else {
+        (bit(57) | bit(58) | bit(59), bit(58) | bit(59) | bit(60), CASTLE_BQ)
+    };
+    let mut n = 0;
+    if pos.castle & ks_right != 0 && occ & ks_empty == 0 {
+        let mut ok = true;
+        let mut b = ks_king;
+        while b != 0 {
+            let s = pop_lsb(&mut b);
+            if pos.square_attacked(s, them, occ_no_king) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            n += 1;
+        }
+    }
+    if pos.castle & qs_right != 0 && occ & qs_empty == 0 {
+        let mut ok = true;
+        let mut b = qs_king;
+        while b != 0 {
+            let s = pop_lsb(&mut b);
+            if pos.square_attacked(s, them, occ_no_king) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            n += 1;
+        }
+    }
+    n
+}
+
 fn sliding_attacks(pt: usize, sq: usize, occ: u64) -> u64 {
     match pt {
         BISHOP => crate::magic::bishop_attacks(sq, occ),
@@ -210,13 +371,13 @@ fn sliding_attacks(pt: usize, sq: usize, occ: u64) -> u64 {
     }
 }
 
-fn push_simple(list: &mut MoveList, from: usize, to: usize, enemies: u64) {
+fn push_simple(list: &mut MoveList, from: usize, to: usize, enemies: u64, pt: usize) {
     let flags = if enemies & bit(to) != 0 {
         FLAG_CAPTURE
     } else {
         FLAG_QUIET
     };
-    list.push(Move::new(from, to, 0, flags));
+    list.push(Move::new(from, to, 0, flags).with_piece(pt));
 }
 
 fn gen_castling(pos: &Position, list: &mut MoveList, occ: u64, occ_no_king: u64, them: usize) {
@@ -246,7 +407,7 @@ fn gen_castling(pos: &Position, list: &mut MoveList, occ: u64, occ_no_king: u64,
             }
         }
         if ok {
-            list.push(Move::new(ks_from, ks_to, 0, FLAG_CASTLE_KS));
+            list.push(Move::new(ks_from, ks_to, 0, FLAG_CASTLE_KS).with_piece(KING));
         }
     }
     if pos.castle & qs_right != 0 && occ & qs_empty == 0 {
@@ -260,7 +421,7 @@ fn gen_castling(pos: &Position, list: &mut MoveList, occ: u64, occ_no_king: u64,
             }
         }
         if ok {
-            list.push(Move::new(qs_from, qs_to, 0, FLAG_CASTLE_QS));
+            list.push(Move::new(qs_from, qs_to, 0, FLAG_CASTLE_QS).with_piece(KING));
         }
     }
     let _ = k;

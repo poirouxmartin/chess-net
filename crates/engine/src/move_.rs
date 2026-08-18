@@ -1,5 +1,6 @@
-//! Move encoding: 18 bits packed in a u32.
-//! bits 0-5: from, bits 6-11: to, bits 12-14: promotion piece, bits 15-17: flags.
+//! Move encoding: 21 bits packed in a u32.
+//! bits 0-5: from, bits 6-11: to, bits 12-14: promotion piece, bits 15-17: flags,
+//! bits 18-20: moving piece type (set by movegen, used by perft fast make/unmake).
 
 pub const FLAG_QUIET: u8 = 0;
 pub const FLAG_DOUBLE: u8 = 1;
@@ -48,6 +49,16 @@ impl Move {
     #[inline(always)]
     pub fn flags(self) -> u8 {
         ((self.0 >> 15) & 7) as u8
+    }
+
+    #[inline(always)]
+    pub fn with_piece(self, pt: usize) -> Move {
+        Move(self.0 | ((pt as u32) << 18))
+    }
+
+    #[inline(always)]
+    pub fn piece_pt(self) -> usize {
+        ((self.0 >> 18) & 7) as usize
     }
 
     #[inline(always)]

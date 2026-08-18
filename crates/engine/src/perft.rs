@@ -11,7 +11,7 @@ use crate::move_::{
     Move, FLAG_CAPTURE, FLAG_CASTLE_KS, FLAG_CASTLE_QS, FLAG_DOUBLE, FLAG_EN_PASSANT, FLAG_PROMO,
     FLAG_PROMO_CAPTURE,
 };
-use crate::movegen::generate_legal;
+use crate::movegen::{count_legal, generate_legal};
 use crate::position::{CASTLE_CLEAR, KING, PAWN, PIECE_TYPES, Position, ROOK, WHITE};
 
 /// Count legal move paths. `perft(pos, 1)` == number of legal moves.
@@ -27,7 +27,7 @@ pub fn perft(pos: &mut Position, depth: u32) -> u64 {
     for m in moves.iter() {
         let undo = make_fast(pos, m);
         nodes += if depth == 2 {
-            generate_legal(pos).len as u64
+            count_legal(pos) as u64
         } else {
             perft(pos, depth - 1)
         };
@@ -54,7 +54,7 @@ pub fn perft_parallel(pos: &mut Position, depth: u32, threads: usize) -> u64 {
                 for &m in chunk {
                     let undo = make_fast(&mut local, m);
                     n += if depth == 2 {
-                        generate_legal(&local).len as u64
+                        count_legal(&local) as u64
                     } else {
                         perft(&mut local, depth - 1)
                     };
@@ -109,7 +109,7 @@ fn make_fast(pos: &mut Position, m: Move) -> FastUndo {
         ep: pos.ep,
     };
 
-    let from_pt = piece_pt_at(pos, from);
+    let from_pt = m.piece_pt();
     let moving_pt = if promo { m.promo_pt() } else { from_pt };
     let base_pt = if promo { PAWN } else { from_pt };
 
@@ -122,7 +122,7 @@ fn make_fast(pos: &mut Position, m: Move) -> FastUndo {
         pos.occ &= !bit(cap_sq);
         undo.captured = Some((them, PAWN));
     } else if flags == FLAG_CAPTURE || flags == FLAG_PROMO_CAPTURE {
-        let cap_pt = piece_pt_at(pos, to);
+        let cap_pt = enemy_piece_pt_at(pos, to, them);
         pos.pieces[them * PIECE_TYPES + cap_pt] &= !bit(to);
         pos.occ &= !bit(to);
         undo.captured = Some((them, cap_pt));
@@ -157,7 +157,7 @@ fn unmake_fast(pos: &mut Position, u: FastUndo) {
     let flags = m.flags();
     let promo = flags == FLAG_PROMO || flags == FLAG_PROMO_CAPTURE;
 
-    let moving_pt = if promo { m.promo_pt() } else { piece_pt_at(pos, to) };
+    let moving_pt = if promo { m.promo_pt() } else { m.piece_pt() };
 
     pos.pieces[mover * PIECE_TYPES + moving_pt] &= !bit(to);
     pos.occ &= !bit(to);
@@ -192,19 +192,14 @@ fn unmake_fast(pos: &mut Position, u: FastUndo) {
 }
 
 #[inline(always)]
-fn piece_pt_at(pos: &Position, sq: usize) -> usize {
+fn enemy_piece_pt_at(pos: &Position, sq: usize, them: usize) -> usize {
     let b = bit(sq);
     for pt in 0..PIECE_TYPES {
-        if pos.pieces[pt] & b != 0 {
+        if pos.pieces[them * PIECE_TYPES + pt] & b != 0 {
             return pt;
         }
     }
-    for pt in 0..PIECE_TYPES {
-        if pos.pieces[PIECE_TYPES + pt] & b != 0 {
-            return pt;
-        }
-    }
-    KING // unreachable for an occupied square
+    KING // unreachable for an occupied enemy square
 }
 
 #[inline(always)]
