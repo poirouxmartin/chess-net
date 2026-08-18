@@ -43,8 +43,9 @@ target/release/chess-net.exe
 ```
 
 UCI commands: `uci`, `isready`, `ucinewgame`, `setoption` (`Hash`,
-`EvalFile`), `position`, `go`, `stop`, plus diagnostics `perft <d>`,
-`divide <d>`, `moves`, `d`, `eval`.
+`EvalFile`), `position`, `go`, `stop`, plus diagnostics `perft <d>`
+(`perft <d> threads <n>` for a parallel run), `divide <d>`, `moves`, `d`,
+`eval`.
 
 Load a neural network instead of the built-in PeSTO evaluation:
 

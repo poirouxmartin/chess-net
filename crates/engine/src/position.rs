@@ -27,7 +27,7 @@ pub const CASTLE_BK: u8 = 4;
 pub const CASTLE_BQ: u8 = 8;
 
 // Castling rights cleared when from/to square moves a king/rook.
-const CASTLE_CLEAR: [u8; 64] = {
+pub const CASTLE_CLEAR: [u8; 64] = {
     let mut t = [0u8; 64];
     let mut i = 0;
     while i < 64 {
@@ -115,7 +115,7 @@ pub struct Undo {
     pub halfmove: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Position {
     /// pieces[color * 6 + piece_type] bitboard.
     pub pieces: [u64; 12],

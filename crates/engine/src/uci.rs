@@ -108,7 +108,13 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
             }
             "perft" => {
                 let depth: u32 = tokens.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
-                let n = crate::perft::perft(&mut pos, depth);
+                let threads: usize = tokens
+                    .iter()
+                    .position(|&t| t == "threads")
+                    .and_then(|i| tokens.get(i + 1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+                let n = crate::perft::perft_parallel(&mut pos, depth, threads);
                 out(&format!("nodes {}", n));
             }
             "divide" => {
