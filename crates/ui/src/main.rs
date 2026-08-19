@@ -8,7 +8,7 @@ use eframe::egui::{
 };
 
 use engine::evaluate::{evaluate, MATE};
-use engine::mcts::{cp_from_prob, mcts_root, MctsLimits};
+use engine::mcts::{cp_from_prob, mcts_parallel, MctsLimits};
 use engine::move_::Move;
 use engine::movegen::generate_legal;
 use engine::position::{BLACK, Position, WHITE};
@@ -80,6 +80,7 @@ struct ChessApp {
     analysis_pending: bool,
     flip: bool,
     movetime_ms: u64,
+    mcts_threads: usize,
     eval_kind: EvalKind,
     nn_file: String,
     nn_error: Option<String>,
@@ -114,6 +115,7 @@ impl ChessApp {
             analysis_pending: false,
             flip: false,
             movetime_ms: 1000,
+            mcts_threads: 0,
             eval_kind: EvalKind::PeSTO,
             nn_file: String::new(),
             nn_error: None,
@@ -223,6 +225,7 @@ impl ChessApp {
         let tx = self.tx.clone();
         let eval = self.eval_fn;
         let ms = self.movetime_ms;
+        let mcts_threads = self.mcts_threads;
         let gen = self.gen;
         let kind = self.search_kind;
         self.active = Some(gen);
@@ -255,11 +258,11 @@ impl ChessApp {
                 }
                 SearchKind::Mcts => {
                     let limits = if analysis {
-                        MctsLimits { playouts: Some(1_000_000), movetime: None }
+                        MctsLimits { playouts: None, movetime: Some(2000), threads: mcts_threads }
                     } else {
-                        MctsLimits { playouts: None, movetime: Some(ms) }
+                        MctsLimits { playouts: None, movetime: Some(ms), threads: mcts_threads }
                     };
-                    let result = mcts_root(&mut pos, &limits, &stop, eval, Some(&mut |p| {
+                    let result = mcts_parallel(&mut pos, &limits, stop.clone(), eval, Some(&mut |p| {
                         let mut l = live.lock().unwrap();
                         *l = LiveInfo {
                             mcts: true,
@@ -655,6 +658,9 @@ impl ChessApp {
                 ui.selectable_value(&mut self.search_kind, SearchKind::AlphaBeta, "Alpha-beta (PVS)");
                 ui.selectable_value(&mut self.search_kind, SearchKind::Mcts, "MCTS (NN)");
             });
+        if self.search_kind == SearchKind::Mcts {
+            ui.add(egui::Slider::new(&mut self.mcts_threads, 0..=32).text("threads MCTS (0 = auto)"));
+        }
 
         ui.separator();
         ui.label("Évaluation");

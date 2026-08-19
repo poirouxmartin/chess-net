@@ -1,6 +1,6 @@
 //! MCTS: legal best move, mate-in-1 detection, terminal positions, budgets.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use engine::evaluate::evaluate;
 use engine::mcts::{mcts_root, MctsLimits};
@@ -10,7 +10,7 @@ use engine::position::Position;
 fn run(pos: &mut Position, playouts: u64) -> engine::mcts::MctsResult {
     mcts_root(
         pos,
-        &MctsLimits { playouts: Some(playouts), movetime: None },
+        &MctsLimits { playouts: Some(playouts), movetime: None, threads: 1 },
         &AtomicBool::new(false),
         evaluate,
         None,
@@ -68,7 +68,7 @@ fn stop_flag_returns_immediately() {
     let stop = AtomicBool::new(true);
     let result = mcts_root(
         &mut pos,
-        &MctsLimits { playouts: Some(1_000_000), movetime: None },
+        &MctsLimits { playouts: Some(1_000_000), movetime: None, threads: 1 },
         &stop,
         evaluate,
         None,
@@ -84,7 +84,7 @@ fn progress_callback_reports_playouts() {
     let mut reports: Vec<u64> = Vec::new();
     let result = mcts_root(
         &mut pos,
-        &MctsLimits { playouts: None, movetime: Some(150) },
+        &MctsLimits { playouts: None, movetime: Some(150), threads: 1 },
         &AtomicBool::new(false),
         evaluate,
         Some(&mut |p| {
@@ -96,4 +96,40 @@ fn progress_callback_reports_playouts() {
     assert!(!result.visits.is_empty());
     assert!(result.visits.iter().any(|(_, v)| *v > 0));
     assert!((0.0..=1.0).contains(&result.value), "value must be a probability");
+}
+
+#[test]
+fn parallel_mcts_finds_mate_in_one() {
+    use std::sync::Arc;
+    engine::init();
+    let mut pos = Position::from_fen("7k/6pp/8/8/8/8/8/R6K w - - 0 1");
+    let result = engine::mcts::mcts_parallel(
+        &mut pos,
+        &MctsLimits { playouts: Some(20_000), movetime: None, threads: 4 },
+        Arc::new(AtomicBool::new(false)),
+        evaluate,
+        None,
+    );
+    assert_eq!(result.best.to_uci(), "a1a8");
+    let total: u32 = result.visits.iter().map(|(_, v)| v).sum();
+    assert_eq!(total, result.playouts as u32, "visit counts must sum to the playout total");
+    assert_eq!(result.visits[0].0.to_uci(), "a1a8");
+}
+
+#[test]
+fn parallel_mcts_returns_legal_move_and_is_faster_than_single() {
+    use std::sync::Arc;
+    engine::init();
+    let mut pos = Position::startpos();
+    let legal = generate_legal(&pos);
+    let result = engine::mcts::mcts_parallel(
+        &mut pos,
+        &MctsLimits { playouts: Some(60_000), movetime: None, threads: 8 },
+        Arc::new(AtomicBool::new(false)),
+        evaluate,
+        None,
+    );
+    assert!(legal.moves[..legal.len].iter().any(|m| *m == result.best));
+    let total: u32 = result.visits.iter().map(|(_, v)| v).sum();
+    assert_eq!(total, result.playouts as u32);
 }
