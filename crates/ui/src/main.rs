@@ -68,11 +68,11 @@ struct ChessApp {
     pos: Position,
     history: Vec<Position>,
     played: Vec<Move>,
+    nav: usize,
     selected: Option<usize>,
     targets: Vec<Move>,
     last_from: Option<usize>,
     last_to: Option<usize>,
-    check_sq: Option<usize>,
     game_over: Option<String>,
     mode: Mode,
     search_kind: SearchKind,
@@ -102,11 +102,11 @@ impl ChessApp {
             pos: Position::startpos(),
             history: Vec::new(),
             played: Vec::new(),
+            nav: 0,
             selected: None,
             targets: Vec::new(),
             last_from: None,
             last_to: None,
-            check_sq: None,
             game_over: None,
             mode: Mode::HumanEngine,
             search_kind: SearchKind::AlphaBeta,
@@ -149,12 +149,12 @@ impl ChessApp {
         );
         self.history.clear();
         self.played.clear();
+        self.nav = 0;
         self.selected = None;
         self.targets.clear();
         self.last_from = None;
         self.last_to = None;
         self.game_over = None;
-        self.check_sq = None;
         self.active = None;
         let _ = self.rx.try_recv();
         let mut l = self.live.lock().unwrap();
@@ -175,7 +175,6 @@ impl ChessApp {
         self.selected = None;
         self.targets.clear();
         self.game_over = None;
-        self.check_sq = None;
         self.last_from = None;
         self.last_to = None;
         self.active = None;
@@ -189,6 +188,16 @@ impl ChessApp {
         if self.mode == Mode::HumanEngine && self.pos.side == BLACK && !self.history.is_empty() {
             self.pos = self.history.pop().unwrap();
             self.played.pop();
+        }
+        self.nav = self.nav.min(self.played.len());
+    }
+
+    /// Position currently displayed (live end of game, or the nav point).
+    fn view_pos(&self) -> Position {
+        if self.nav < self.played.len() {
+            self.history[self.nav]
+        } else {
+            self.pos
         }
     }
 
@@ -236,6 +245,9 @@ impl ChessApp {
                             nodes: it.nodes,
                             time_ms: it.time_ms,
                             pv: it.pv.clone(),
+                            lines: it.lines.iter()
+                                .map(|x| LiveLine { mv: x.mv, score: x.score, pv: x.pv.clone(), visits: 0 })
+                                .collect(),
                             ..LiveInfo::default()
                         };
                     }));
@@ -299,12 +311,13 @@ impl ChessApp {
     fn apply(&mut self, m: Move) {
         self.history.push(self.pos);
         self.played.push(m);
+        self.nav = self.played.len();
         self.last_from = Some(m.from());
         self.last_to = Some(m.to());
         self.selected = None;
         self.targets.clear();
         self.pos.make_move(m);
-        self.check_sq = self.pos.in_check().then(|| self.pos.king_sq[self.pos.side]);
+        play_move_sound();
         let legal = generate_legal(&self.pos);
         if legal.len == 0 {
             self.game_over = Some(if self.pos.in_check() {
@@ -336,6 +349,9 @@ impl ChessApp {
     }
 
     fn maybe_engine_plays(&mut self) {
+        if self.nav < self.played.len() {
+            return;
+        }
         if self.analyzing {
             if self.analysis_pending && !self.is_searching() && self.game_over.is_none() {
                 self.analysis_pending = false;
@@ -382,22 +398,28 @@ impl ChessApp {
             }
         };
 
-        // squares
+        // squares (a1 is dark)
         for rank in 0..8 {
             for file in 0..8 {
                 let s = rank * 8 + file;
                 let color = if (rank + file) % 2 == 0 {
-                    Color32::from_rgb(0xF0, 0xD9, 0xB5)
-                } else {
                     Color32::from_rgb(0xB5, 0x88, 0x63)
+                } else {
+                    Color32::from_rgb(0xF0, 0xD9, 0xB5)
                 };
                 let r = Rect::from_min_size(to_xy(s), Vec2::splat(sq_px));
                 painter.rect_filled(r, 0.0, color);
             }
         }
 
-        // highlights: last move
-        if let (Some(f), Some(t)) = (self.last_from, self.last_to) {
+        // highlights: last move (or currently viewed move)
+        let (hl_from, hl_to) = if self.nav > 0 {
+            let m = self.played[self.nav - 1];
+            (Some(m.from()), Some(m.to()))
+        } else {
+            (None, None)
+        };
+        if let (Some(f), Some(t)) = (hl_from, hl_to) {
             let tint = Color32::from_rgba_unmultiplied(255, 255, 0, 55);
             for s in [f, t] {
                 let r = Rect::from_min_size(to_xy(s), Vec2::splat(sq_px));
@@ -409,18 +431,34 @@ impl ChessApp {
             let r = Rect::from_min_size(to_xy(s), Vec2::splat(sq_px));
             painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(80, 220, 80, 90));
         }
-        // check
-        if let Some(s) = self.check_sq {
+        // check (viewed position)
+        let pos = self.view_pos();
+        let check_sq = pos.in_check().then(|| pos.king_sq[pos.side]);
+        if let Some(s) = check_sq {
             let c = to_xy(s) + Vec2::splat(sq_px / 2.0);
             painter.circle_stroke(c, sq_px * 0.42, Stroke::new(4.0, Color32::from_rgb(220, 40, 40)));
         }
 
-        // pieces
+        // pieces (skip the one being dragged)
+        let dragging = ui.input(|i| i.pointer.is_decidedly_dragging());
         let font_size = sq_px * 0.82;
         for sq in 0..64 {
-            if let Some((c, pt)) = self.pos.piece_at(sq) {
+            if dragging && self.selected == Some(sq) {
+                continue;
+            }
+            if let Some((c, pt)) = pos.piece_at(sq) {
                 let center = to_xy(sq) + Vec2::splat(sq_px / 2.0);
                 draw_piece(&painter, center, pt, c == WHITE, font_size);
+            }
+        }
+        // drag ghost: piece follows the cursor
+        if dragging {
+            if let Some(sel) = self.selected {
+                if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                    if let Some((c, pt)) = pos.piece_at(sel) {
+                        draw_piece(&painter, p, pt, c == WHITE, font_size);
+                    }
+                }
             }
         }
 
@@ -513,6 +551,9 @@ impl ChessApp {
         if !self.human_has_turn() || self.game_over.is_some() {
             return;
         }
+        if self.nav < self.played.len() {
+            return;
+        }
         // press on a target of the selected piece: move immediately
         if let Some(sel) = self.selected {
             if let Some(m) = self.targets.iter().copied().find(|m| m.to() == sq) {
@@ -544,6 +585,9 @@ impl ChessApp {
 
     fn release_square(&mut self, sq: usize) {
         if !self.human_has_turn() || self.game_over.is_some() {
+            return;
+        }
+        if self.nav < self.played.len() {
             return;
         }
         if self.selected.is_some() {
@@ -720,9 +764,10 @@ impl ChessApp {
         }
 
         ui.separator();
+        let vpos = self.view_pos();
         ui.label(format!(
             "Au trait : {}",
-            if self.pos.side == 0 { "Blancs" } else { "Noirs" }
+            if vpos.side == 0 { "Blancs" } else { "Noirs" }
         ));
         if let Some(go) = &self.game_over {
             ui.colored_label(Color32::from_rgb(230, 90, 90), go);
@@ -730,14 +775,49 @@ impl ChessApp {
         if !self.status.is_empty() {
             ui.label(&self.status);
         }
-        ui.monospace(self.pos.to_fen());
+        ui.monospace(vpos.to_fen());
 
-ui.separator();
+        ui.separator();
         ui.label(format!("Coups joués ({})", self.played.len()));
-        if let Some(start) = self.history.first().copied() {
-            egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                ui.monospace(san_line(start, &self.played));
+        if self.nav < self.played.len() {
+            ui.colored_label(
+                Color32::from_rgb(230, 170, 60),
+                format!("navigation — coup {}/{} (revenir à la fin pour jouer)", self.nav, self.played.len()),
+            );
+        }
+        if !self.played.is_empty() {
+            ui.horizontal(|ui| {
+                if ui.button("<<").clicked() {
+                    self.nav = 0;
+                }
+                if ui.button("<").clicked() {
+                    self.nav = self.nav.saturating_sub(1);
+                }
+                if ui.button(">").clicked() {
+                    self.nav = (self.nav + 1).min(self.played.len());
+                }
+                if ui.button(">>").clicked() {
+                    self.nav = self.played.len();
+                }
             });
+            if let Some(start) = self.history.first().copied() {
+                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    let mut p = start;
+                    for (i, m) in self.played.iter().enumerate() {
+                        let san = to_san(&p, *m);
+                        let text = if p.side == WHITE {
+                            format!("{}. {san}", p.fullmove)
+                        } else {
+                            san
+                        };
+                        let sel = self.nav == i + 1;
+                        if ui.selectable_label(sel, text).clicked() {
+                            self.nav = i + 1;
+                        }
+                        p.make_move(*m);
+                    }
+                });
+            }
         }
     }
 }
@@ -805,6 +885,15 @@ fn fmt_u64(n: u64) -> String {
 }
 
 const GLYPHS: [char; 6] = ['♟', '♞', '♝', '♜', '♛', '♚'];
+
+fn play_move_sound() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Diagnostics::Debug::MessageBeep;
+        // 0xFFFFFFFF = default beep (plays the default sound)
+        MessageBeep(0xFFFFFFFF);
+    }
+}
 
 fn draw_piece(painter: &egui::Painter, center: Pos2, pt: usize, white: bool, font_size: f32) {
     let glyph = GLYPHS[pt];

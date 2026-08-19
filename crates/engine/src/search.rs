@@ -53,6 +53,8 @@ pub struct SearchIter {
     pub nodes: u64,
     pub time_ms: u64,
     pub pv: Vec<Move>,
+    /// Top lines when `Limits::multi_pv > 1`.
+    pub lines: Vec<MultiLine>,
 }
 
 struct RootResult {
@@ -124,6 +126,7 @@ impl Searcher {
         let mut score = 0;
         let mut done = 0;
         let mut pv = Vec::new();
+        let mut lines = Vec::new();
 
         for d in 1..=max_depth {
             let r = self.root_search(pos, d as i32, stop, eval);
@@ -131,6 +134,9 @@ impl Searcher {
             score = r.score;
             done = d as i32;
             pv = self.pv_table[0][..self.pv_len[0]].to_vec();
+            if multi > 1 {
+                lines = self.compute_multi_pv(pos, d as i32, stop, eval, multi);
+            }
             if let Some(cb) = on_iter.as_mut() {
                 cb(&SearchIter {
                     depth: done,
@@ -138,6 +144,7 @@ impl Searcher {
                     nodes: self.nodes,
                     time_ms: self.start.elapsed().as_millis() as u64,
                     pv: pv.clone(),
+                    lines: lines.clone(),
                 });
             }
             if stop.load(Ordering::Relaxed) {
@@ -147,12 +154,6 @@ impl Searcher {
                 break;
             }
         }
-
-        let lines = if multi > 1 {
-            self.compute_multi_pv(pos, done, stop, eval, multi)
-        } else {
-            Vec::new()
-        };
 
         SearchResult {
             best,
@@ -319,6 +320,14 @@ impl Searcher {
                 if score >= beta {
                     return score;
                 }
+            }
+        }
+
+        // Reverse futility pruning: position is clearly above beta, skip movegen.
+        if depth <= 7 && !in_check && ply > 0 {
+            let e = eval(pos);
+            if e - 90 * depth >= beta {
+                return e;
             }
         }
 

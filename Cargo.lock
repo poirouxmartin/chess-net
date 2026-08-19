@@ -605,6 +605,7 @@ dependencies = [
  "egui",
  "engine",
  "nn",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
