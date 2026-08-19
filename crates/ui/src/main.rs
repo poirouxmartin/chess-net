@@ -199,7 +199,8 @@ impl ChessApp {
             return;
         }
         let mut pos = self.pos;
-        let stop = self.stop.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        self.stop = stop.clone();
         let live = self.live.clone();
         let tx = self.tx.clone();
         let eval = self.eval_fn;

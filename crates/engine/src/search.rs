@@ -193,6 +193,11 @@ impl Searcher {
             }
         }
 
+        // Fallback si la recherche est interrompue avant le premier coup bouclé.
+        if alpha == -INF {
+            alpha = eval(pos);
+        }
+
         RootResult { best: best_move, score: alpha }
     }
 
