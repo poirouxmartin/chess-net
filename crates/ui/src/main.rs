@@ -12,7 +12,8 @@ use engine::mcts::{cp_from_prob, mcts_root, MctsLimits};
 use engine::move_::Move;
 use engine::movegen::generate_legal;
 use engine::position::{BLACK, Position, WHITE};
-use engine::search::{Limits, SearchIter, Searcher};
+use engine::san::to_san;
+use engine::search::{Limits, MultiLine, SearchIter, Searcher};
 
 const BOARD_PX: f32 = 640.0;
 const BOARD_BG: Color32 = Color32::from_rgb(45, 45, 48);
@@ -42,6 +43,14 @@ enum GameKind {
     Setup,
 }
 
+#[derive(Clone)]
+struct LiveLine {
+    mv: Move,
+    score: i32,
+    pv: Vec<Move>,
+    visits: u32,
+}
+
 #[derive(Default)]
 struct LiveInfo {
     mcts: bool,
@@ -52,7 +61,7 @@ struct LiveInfo {
     nodes: u64,
     time_ms: u64,
     pv: Vec<Move>,
-    mcts_visits: Vec<(Move, u32)>,
+    lines: Vec<LiveLine>,
 }
 
 struct ChessApp {
@@ -81,8 +90,8 @@ struct ChessApp {
     active: Option<u64>,
     live: Arc<Mutex<LiveInfo>>,
     stop: Arc<AtomicBool>,
-    tx: mpsc::Sender<(u64, Move)>,
-    rx: mpsc::Receiver<(u64, Move)>,
+    tx: mpsc::Sender<(u64, Move, Vec<MultiLine>)>,
+    rx: mpsc::Receiver<(u64, Move, Vec<MultiLine>)>,
     eval_fn: engine::search::EvalFn,
 }
 
@@ -210,11 +219,11 @@ impl ChessApp {
         self.active = Some(gen);
         *self.live.lock().unwrap() = LiveInfo::default();
         std::thread::spawn(move || {
-            let best = match kind {
+            let (best, lines) = match kind {
                 SearchKind::AlphaBeta => {
                     let mut searcher = Searcher::new(64);
                     let limits = if analysis {
-                        Limits { depth: None, ..Default::default() }
+                        Limits { multi_pv: 5, depth: None, ..Default::default() }
                     } else {
                         Limits { movetime: Some(ms), ..Default::default() }
                     };
@@ -230,7 +239,7 @@ impl ChessApp {
                             ..LiveInfo::default()
                         };
                     }));
-                    result.best
+                    (result.best, result.lines)
                 }
                 SearchKind::Mcts => {
                     let limits = if analysis {
@@ -248,25 +257,39 @@ impl ChessApp {
                             nodes: p.playouts,
                             time_ms: p.time_ms,
                             pv: p.moves.iter().map(|(m, _)| *m).collect(),
-                            mcts_visits: p.moves.clone(),
+                            lines: p
+                                .moves
+                                .iter()
+                                .map(|(m, v)| LiveLine { mv: *m, score: 0, pv: vec![*m], visits: *v })
+                                .collect(),
                             ..LiveInfo::default()
                         };
                     }));
-                    result.best
+                    let lines = result
+                        .visits
+                        .iter()
+                        .map(|(m, _)| MultiLine { mv: *m, score: 0, pv: vec![*m] })
+                        .collect();
+                    (result.best, lines)
                 }
             };
-            let _ = tx.send((gen, best));
+            let _ = tx.send((gen, best, lines));
         });
     }
 
     fn engine_move_arrived(&mut self) {
-        if let Ok((gen, m)) = self.rx.try_recv() {
+        if let Ok((gen, m, lines)) = self.rx.try_recv() {
             if self.active != Some(gen) {
                 return;
             }
             self.active = None;
             if self.analyzing {
-                // Analyse : garder le plateau, laisser les stats affichées.
+                // Analyse : garder le plateau, afficher les variantes finales.
+                let mut l = self.live.lock().unwrap();
+                l.lines = lines
+                    .into_iter()
+                    .map(|x| LiveLine { mv: x.mv, score: x.score, pv: x.pv, visits: 0 })
+                    .collect();
                 return;
             }
             self.apply(m);
@@ -332,7 +355,7 @@ impl ChessApp {
 
     fn draw_board(&mut self, ui: &mut egui::Ui) {
         let sq_px = BOARD_PX / 8.0;
-        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BOARD_PX), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(BOARD_PX), Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 4.0, BOARD_BG);
         let board_rect = Rect::from_min_size(rect.min, Vec2::splat(BOARD_PX));
@@ -412,40 +435,85 @@ impl ChessApp {
             }
         }
 
-        // analysis: best-move highlight + PV arrows
-        if self.analyzing && self.active.is_some() {
+        // analysis: best-move highlight + numbered arrows (root moves only)
+        if self.analyzing {
             let info = self.live.lock().unwrap().clone_into_info();
-            if !info.pv.is_empty() {
-                let m0 = info.pv[0];
+            let arrows: Vec<(Move, String)> = if !info.lines.is_empty() {
+                info.lines
+                    .iter()
+                    .take(5)
+                    .map(|l| {
+                        let num = if info.mcts {
+                            let total = info.lines.iter().map(|x| x.visits as u64).sum::<u64>().max(1);
+                            format!("{:.0}%", l.visits as f64 * 100.0 / total as f64)
+                        } else {
+                            fmt_score(l.score)
+                        };
+                        (l.mv, num)
+                    })
+                    .collect()
+            } else if self.active.is_some() && !info.pv.is_empty() {
+                vec![(info.pv[0], fmt_score(info.score))]
+            } else {
+                Vec::new()
+            };
+            if !arrows.is_empty() {
+                let best = arrows[0].0;
                 let tint = Color32::from_rgba_unmultiplied(80, 200, 80, 80);
-                for s in [m0.from(), m0.to()] {
+                for s in [best.from(), best.to()] {
                     let r = Rect::from_min_size(to_xy(s), Vec2::splat(sq_px));
                     painter.rect_filled(r, 0.0, tint);
                 }
-                let stroke = Stroke::new(5.0, Color32::from_rgba_unmultiplied(90, 210, 90, 200));
-                for m in info.pv.iter().take(3) {
+                for (i, (m, num)) in arrows.iter().enumerate() {
                     let a = to_xy(m.from()) + Vec2::splat(sq_px / 2.0);
                     let b = to_xy(m.to()) + Vec2::splat(sq_px / 2.0);
                     let dir = b - a;
-                    painter.arrow(a + dir * 0.12, dir * 0.76, stroke);
+                    let width = if i == 0 { 6.0 } else { 3.0 };
+                    let alpha = if i == 0 { 220 } else { 150 };
+                    painter.arrow(
+                        a + dir * 0.12,
+                        dir * 0.76,
+                        Stroke::new(width, Color32::from_rgba_unmultiplied(90, 210, 90, alpha)),
+                    );
+                    // eval label near the from-square
+                    let label_pos = a + dir * 0.30;
+                    let galley = painter.layout_no_wrap(
+                        num.clone(),
+                        FontId::monospace(13.0),
+                        Color32::from_rgb(20, 20, 20),
+                    );
+                    let pad = Vec2::splat(2.0);
+                    let text_rect = galley.rect.translate(label_pos.to_vec2() - galley.rect.center().to_vec2());
+                    painter.rect_filled(text_rect.expand2(pad), 3.0, Color32::from_rgba_unmultiplied(230, 230, 230, 210));
+                    painter.galley(text_rect.min, galley, Color32::from_rgb(20, 20, 20));
                 }
             }
         }
 
-        // click handling
-        if let Some(click) = resp.interact_pointer_pos() {
-            let s = sq_at(click);
-            if s != usize::MAX {
-                self.handle_click(s);
+        // click handling: press selects (or immediate move), release completes.
+        if resp.hovered() && ui.input(|i| i.pointer.primary_pressed()) {
+            if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
+                let s = sq_at(p);
+                if s != usize::MAX {
+                    self.press_square(s);
+                }
+            }
+        }
+        if resp.drag_stopped() || resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let s = sq_at(p);
+                if s != usize::MAX {
+                    self.release_square(s);
+                }
             }
         }
     }
 
-    fn handle_click(&mut self, sq: usize) {
+    fn press_square(&mut self, sq: usize) {
         if !self.human_has_turn() || self.game_over.is_some() {
             return;
         }
-        // try to move the selected piece there
+        // press on a target of the selected piece: move immediately
         if let Some(sel) = self.selected {
             if let Some(m) = self.targets.iter().copied().find(|m| m.to() == sq) {
                 self.human_move(m);
@@ -472,6 +540,17 @@ impl ChessApp {
         }
         self.selected = None;
         self.targets.clear();
+    }
+
+    fn release_square(&mut self, sq: usize) {
+        if !self.human_has_turn() || self.game_over.is_some() {
+            return;
+        }
+        if self.selected.is_some() {
+            if let Some(m) = self.targets.iter().copied().find(|m| m.to() == sq) {
+                self.human_move(m);
+            }
+        }
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
@@ -603,23 +682,41 @@ impl ChessApp {
                 ui.label(format!("plouts {}", fmt_u64(info.playouts)));
                 ui.label(format!("{:.1} s", info.time_ms as f32 / 1000.0));
             });
+            ui.label(format!("{:.0} plouts/s", nps(info.playouts, info.time_ms)));
             ui.label(format!("P(gagne) {:.1}%", info.value * 100.0));
             ui.label(format!("score {}", fmt_score(info.score)));
-            ui.monospace(
-                info.mcts_visits
-                    .iter()
-                    .map(|(m, v)| format!("{} {}", m.to_uci(), v))
-                    .collect::<Vec<_>>()
-                    .join("  "),
-            );
         } else {
             ui.horizontal(|ui| {
                 ui.label(format!("prof {}", info.depth));
                 ui.label(format!("nœuds {}", fmt_u64(info.nodes)));
                 ui.label(format!("{:.1} s", info.time_ms as f32 / 1000.0));
             });
+            ui.label(format!("{:.0} nœuds/s", nps(info.nodes, info.time_ms)));
             ui.label(format!("score {}", fmt_score(info.score)));
-            ui.monospace(format!("PV  {}", info.pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ")));
+        }
+
+        if !info.lines.is_empty() {
+            ui.separator();
+            ui.label("Variantes");
+            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                for (i, line) in info.lines.iter().enumerate() {
+                    let num = if info.mcts {
+                        let total = info.lines.iter().map(|l| l.visits as u64).sum::<u64>().max(1);
+                        format!("{:.0}%", line.visits as f64 * 100.0 / total as f64)
+                    } else {
+                        fmt_score(line.score)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("{}.", i + 1));
+                        ui.monospace(to_san(&self.pos, line.mv));
+                        ui.monospace(num);
+                    });
+                    let pv_text = san_line(self.pos, &line.pv);
+                    if !line.pv.is_empty() {
+                        ui.monospace(pv_text);
+                    }
+                }
+            });
         }
 
         ui.separator();
@@ -635,24 +732,13 @@ impl ChessApp {
         }
         ui.monospace(self.pos.to_fen());
 
-        ui.separator();
+ui.separator();
         ui.label(format!("Coups joués ({})", self.played.len()));
-        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-            for (i, m) in self.played.iter().enumerate() {
-                if i % 2 == 0 {
-                    let black = self.played.get(i + 1).map(|b| b.to_uci());
-                    ui.monospace(format!(
-                        "{:>2}. {}  {}",
-                        i / 2 + 1,
-                        m.to_uci(),
-                        black.as_deref().unwrap_or("")
-                    ));
-                }
-            }
-            if self.played.is_empty() {
-                ui.weak("—");
-            }
-        });
+        if let Some(start) = self.history.first().copied() {
+            egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                ui.monospace(san_line(start, &self.played));
+            });
+        }
     }
 }
 
@@ -667,7 +753,7 @@ impl LiveInfo {
             nodes: self.nodes,
             time_ms: self.time_ms,
             pv: self.pv.clone(),
-            mcts_visits: self.mcts_visits.clone(),
+            lines: self.lines.clone(),
         }
     }
 }
@@ -680,6 +766,32 @@ fn fmt_score(s: i32) -> String {
     } else {
         format!("{:.2}", s as f32 / 100.0)
     }
+}
+
+fn nps(n: u64, time_ms: u64) -> f64 {
+    if time_ms == 0 {
+        0.0
+    } else {
+        n as f64 * 1000.0 / time_ms as f64
+    }
+}
+
+/// Numbered SAN line for `moves` played from `pos`, e.g. "1. e4 e5 2. Nf3 Nc6".
+fn san_line(mut pos: Position, moves: &[Move]) -> String {
+    let mut out = Vec::new();
+    for m in moves {
+        let san = to_san(&pos, *m);
+        let prefix = if pos.side == WHITE {
+            format!("{}. ", pos.fullmove)
+        } else if out.is_empty() {
+            format!("{}... ", pos.fullmove)
+        } else {
+            String::new()
+        };
+        out.push(format!("{prefix}{san}"));
+        pos.make_move(*m);
+    }
+    out.join(" ")
 }
 
 fn fmt_u64(n: u64) -> String {

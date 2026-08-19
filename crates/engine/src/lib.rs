@@ -9,6 +9,7 @@ pub mod move_;
 pub mod movegen;
 pub mod perft;
 pub mod position;
+pub mod san;
 pub mod search;
 pub mod tt;
 pub mod uci;

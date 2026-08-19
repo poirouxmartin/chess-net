@@ -2,6 +2,7 @@
 //! history heuristic, null-move pruning, time management.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::cmp::Reverse;
 use std::time::{Duration, Instant};
 
 use crate::evaluate::{MATE, INF};
@@ -22,6 +23,16 @@ pub struct Limits {
     pub winc: Option<u64>,
     pub binc: Option<u64>,
     pub depth: Option<i32>,
+    /// Number of principal variations to report (0 or 1 = single PV).
+    pub multi_pv: u8,
+}
+
+/// One alternative line: root move, its score and full PV.
+#[derive(Clone)]
+pub struct MultiLine {
+    pub mv: Move,
+    pub score: i32,
+    pub pv: Vec<Move>,
 }
 
 pub struct SearchResult {
@@ -31,6 +42,8 @@ pub struct SearchResult {
     pub nodes: u64,
     pub pv: Vec<Move>,
     pub time_ms: u64,
+    /// Filled only when `Limits::multi_pv > 1`.
+    pub lines: Vec<MultiLine>,
 }
 
 /// Snapshot of one completed iterative-deepening iteration, for live UI.
@@ -106,6 +119,7 @@ impl Searcher {
         }
 
         let max_depth = limits.depth.unwrap_or(64).clamp(1, 64) as usize;
+        let multi = limits.multi_pv.max(1) as usize;
         let mut best = Move::null();
         let mut score = 0;
         let mut done = 0;
@@ -134,6 +148,12 @@ impl Searcher {
             }
         }
 
+        let lines = if multi > 1 {
+            self.compute_multi_pv(pos, done, stop, eval, multi)
+        } else {
+            Vec::new()
+        };
+
         SearchResult {
             best,
             score,
@@ -141,6 +161,7 @@ impl Searcher {
             nodes: self.nodes,
             pv,
             time_ms: self.start.elapsed().as_millis() as u64,
+            lines,
         }
     }
 
@@ -199,6 +220,43 @@ impl Searcher {
         }
 
         RootResult { best: best_move, score: alpha }
+    }
+
+    /// Re-searches every legal root move at `depth` with a full window to
+    /// collect the top `multi` lines (score + PV). Used for analysis UIs.
+    fn compute_multi_pv(
+        &mut self,
+        pos: &mut Position,
+        depth: i32,
+        stop: &AtomicBool,
+        eval: EvalFn,
+        multi: usize,
+    ) -> Vec<MultiLine> {
+        let mut moves = generate_legal(pos);
+        if moves.len == 0 {
+            return Vec::new();
+        }
+        self.order_moves(pos, &mut moves, None, 0);
+
+        let mut lines = Vec::new();
+        for i in 0..moves.len {
+            let m = moves.get(i);
+            self.pv_len[1] = 0;
+            let undo = pos.make_move(m);
+            self.key_hist.push(pos.key);
+            let s = -self.negamax(pos, depth - 1, -INF, INF, 1, stop, eval);
+            self.key_hist.pop();
+            pos.unmake_move(undo);
+            let mut pv = vec![m];
+            pv.extend_from_slice(&self.pv_table[1][..self.pv_len[1]]);
+            lines.push(MultiLine { mv: m, score: s, pv });
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        lines.sort_by_key(|l| Reverse(l.score));
+        lines.truncate(multi);
+        lines
     }
 
     #[allow(clippy::too_many_arguments)]
