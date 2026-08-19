@@ -1,4 +1,4 @@
-//! Alpha-beta search: iterative deepening, PVS, quiescence, TT, killers,
+﻿//! Alpha-beta search: iterative deepening, PVS, quiescence, TT, killers,
 //! history heuristic, null-move pruning, time management.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,12 +27,14 @@ pub struct Limits {
     pub multi_pv: u8,
 }
 
-/// One alternative line: root move, its score and full PV.
+/// One alternative line: root move, its score and full PV. `visits` is only
+/// meaningful for MCTS results.
 #[derive(Clone)]
 pub struct MultiLine {
     pub mv: Move,
     pub score: i32,
     pub pv: Vec<Move>,
+    pub visits: u32,
 }
 
 pub struct SearchResult {
@@ -215,7 +217,7 @@ impl Searcher {
             }
         }
 
-        // Fallback si la recherche est interrompue avant le premier coup bouclé.
+        // Fallback si la recherche est interrompue avant le premier coup bouclÃ©.
         if alpha == -INF {
             alpha = eval(pos);
         }
@@ -250,7 +252,7 @@ impl Searcher {
             pos.unmake_move(undo);
             let mut pv = vec![m];
             pv.extend_from_slice(&self.pv_table[1][..self.pv_len[1]]);
-            lines.push(MultiLine { mv: m, score: s, pv });
+            lines.push(MultiLine { mv: m, score: s, pv, visits: 0 });
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -272,6 +274,10 @@ impl Searcher {
         eval: EvalFn,
     ) -> i32 {
         self.nodes += 1;
+        // Reset the PV slot first: any early return (time-up, TT cutoff,
+        // null-move, RFP, quiescence, mate) leaves `pv_len[ply] == 0` so the
+        // parent never copies a stale PV from an unrelated position.
+        self.pv_len[ply] = 0;
         if (self.nodes & 1023) == 0 && self.time_up(stop) {
             return 0;
         }
@@ -341,7 +347,6 @@ impl Searcher {
         let mut best = -INF;
         let mut best_move = Move::null();
         let mut alpha0 = alpha;
-        self.pv_len[ply] = 0;
 
         for i in 0..moves.len {
             let m = moves.get(i);
@@ -428,6 +433,9 @@ impl Searcher {
         eval: EvalFn,
     ) -> i32 {
         self.nodes += 1;
+        // Same PV-slot reset as negamax: a quiescence leaf is never part of a
+        // PV, so a stale length from an earlier position must not leak up.
+        self.pv_len[ply] = 0;
         if (self.nodes & 1023) == 0 && self.time_up(stop) {
             return 0;
         }

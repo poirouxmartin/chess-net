@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use crate::attack::{is_aligned, king_attacks, knight_attacks, pawn_attacks};
 use crate::bitboard::{bit, file_of, pop_lsb, rank_of};
 use crate::magic::{bishop_attacks, rook_attacks};
-use crate::move_::{parse_sq, Move, FLAG_CASTLE_KS, FLAG_CASTLE_QS, FLAG_CAPTURE, FLAG_DOUBLE, FLAG_EN_PASSANT, FLAG_PROMO, FLAG_PROMO_CAPTURE};
+use crate::move_::{parse_sq_checked, Move, FLAG_CASTLE_KS, FLAG_CASTLE_QS, FLAG_CAPTURE, FLAG_DOUBLE, FLAG_EN_PASSANT, FLAG_PROMO, FLAG_PROMO_CAPTURE};
 
 pub const WHITE: usize = 0;
 pub const BLACK: usize = 1;
@@ -136,22 +136,23 @@ impl Position {
 
     pub fn from_fen(fen: &str) -> Self {
         let parts: Vec<&str> = fen.split_whitespace().collect();
-        let board = parts[0];
-        let side = if parts[1] == "w" { WHITE } else { BLACK };
+        let board = parts.first().copied().unwrap_or("");
+        let side = if parts.get(1).copied() == Some("w") { WHITE } else { BLACK };
         let mut castle = 0u8;
-        for c in parts[2].chars() {
-            match c {
-                'K' => castle |= CASTLE_WK,
-                'Q' => castle |= CASTLE_WQ,
-                'k' => castle |= CASTLE_BK,
-                'q' => castle |= CASTLE_BQ,
-                _ => {}
+        if let Some(p) = parts.get(2) {
+            for c in p.chars() {
+                match c {
+                    'K' => castle |= CASTLE_WK,
+                    'Q' => castle |= CASTLE_WQ,
+                    'k' => castle |= CASTLE_BK,
+                    'q' => castle |= CASTLE_BQ,
+                    _ => {}
+                }
             }
         }
-        let ep = if parts[3] == "-" {
-            None
-        } else {
-            Some(parse_sq(parts[3]))
+        let ep = match parts.get(3).copied() {
+            Some("-") | None => None,
+            Some(s) => parse_sq_checked(s),
         };
         let halfmove = parts.get(4).map_or(0, |s| s.parse().unwrap_or(0));
         let fullmove = parts.get(5).map_or(1, |s| s.parse().unwrap_or(1));
@@ -174,16 +175,27 @@ impl Position {
             match ch {
                 '1'..='8' => file += ch.to_digit(10).unwrap() as usize,
                 '/' => {
+                    if rank == 0 {
+                        continue;
+                    }
                     rank -= 1;
                     file = 0;
                 }
                 _ => {
+                    let sq = rank * 8 + file;
+                    if sq >= 64 {
+                        file += 1;
+                        continue;
+                    }
                     let color = if ch.is_uppercase() { WHITE } else { BLACK };
-                    let pt = PIECE_CHARS
+                    let Some(pt) = PIECE_CHARS
                         .iter()
                         .position(|&c| c == ch.to_ascii_lowercase())
-                        .unwrap();
-                    p.add_piece(color, rank * 8 + file, pt);
+                    else {
+                        file += 1;
+                        continue;
+                    };
+                    p.add_piece(color, sq, pt);
                     file += 1;
                 }
             }

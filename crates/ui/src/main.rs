@@ -283,7 +283,7 @@ impl ChessApp {
                     let lines = result
                         .visits
                         .iter()
-                        .map(|(m, _)| MultiLine { mv: *m, score: 0, pv: vec![*m] })
+                        .map(|(m, v)| MultiLine { mv: *m, score: 0, pv: vec![*m], visits: *v })
                         .collect();
                     (result.best, lines)
                 }
@@ -303,7 +303,7 @@ impl ChessApp {
                 let mut l = self.live.lock().unwrap();
                 l.lines = lines
                     .into_iter()
-                    .map(|x| LiveLine { mv: x.mv, score: x.score, pv: x.pv, visits: 0 })
+                    .map(|x| LiveLine { mv: x.mv, score: x.score, pv: x.pv, visits: x.visits })
                     .collect();
                 return;
             }

@@ -121,6 +121,15 @@ pub fn parse_sq(name: &str) -> usize {
     rank * 8 + file
 }
 
+/// `parse_sq` returning `None` instead of panicking on malformed input.
+pub fn parse_sq_checked(name: &str) -> Option<usize> {
+    let b = name.as_bytes();
+    if b.len() != 2 || !b"abcdefgh".contains(&b[0]) || !b"12345678".contains(&b[1]) {
+        return None;
+    }
+    Some(parse_sq(name))
+}
+
 pub fn promo_char(p: u8) -> char {
     match p {
         PROMO_QUEEN => 'q',
