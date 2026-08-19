@@ -67,6 +67,8 @@ struct ChessApp {
     game_over: Option<String>,
     mode: Mode,
     search_kind: SearchKind,
+    analyzing: bool,
+    analysis_pending: bool,
     flip: bool,
     movetime_ms: u64,
     eval_kind: EvalKind,
@@ -99,6 +101,8 @@ impl ChessApp {
             game_over: None,
             mode: Mode::HumanEngine,
             search_kind: SearchKind::AlphaBeta,
+            analyzing: false,
+            analysis_pending: false,
             flip: false,
             movetime_ms: 1000,
             eval_kind: EvalKind::PeSTO,
@@ -146,6 +150,9 @@ impl ChessApp {
         let _ = self.rx.try_recv();
         let mut l = self.live.lock().unwrap();
         *l = LiveInfo::default();
+        if self.analyzing {
+            self.analysis_pending = true;
+        }
     }
 
     fn undo(&mut self) {
@@ -166,6 +173,9 @@ impl ChessApp {
         let _ = self.rx.try_recv();
         let mut l = self.live.lock().unwrap();
         *l = LiveInfo::default();
+        if self.analyzing {
+            self.analysis_pending = true;
+        }
         // reculer d'un coup de plus si le moteur vient de jouer et c'est au tour du moteur
         if self.mode == Mode::HumanEngine && self.pos.side == BLACK && !self.history.is_empty() {
             self.pos = self.history.pop().unwrap();
@@ -184,7 +194,7 @@ impl ChessApp {
         let _ = self.rx.try_recv();
     }
 
-    fn trigger_engine(&mut self) {
+    fn trigger_engine(&mut self, analysis: bool) {
         if self.active.is_some() || self.game_over.is_some() {
             return;
         }
@@ -202,7 +212,11 @@ impl ChessApp {
             let best = match kind {
                 SearchKind::AlphaBeta => {
                     let mut searcher = Searcher::new(64);
-                    let limits = Limits { movetime: Some(ms), ..Default::default() };
+                    let limits = if analysis {
+                        Limits { depth: None, ..Default::default() }
+                    } else {
+                        Limits { movetime: Some(ms), ..Default::default() }
+                    };
                     let result = searcher.think_cb(&mut pos, &limits, &stop, eval, Some(&mut |it: &SearchIter| {
                         let mut l = live.lock().unwrap();
                         *l = LiveInfo {
@@ -218,7 +232,11 @@ impl ChessApp {
                     result.best
                 }
                 SearchKind::Mcts => {
-                    let limits = MctsLimits { playouts: None, movetime: Some(ms) };
+                    let limits = if analysis {
+                        MctsLimits { playouts: Some(1_000_000), movetime: None }
+                    } else {
+                        MctsLimits { playouts: None, movetime: Some(ms) }
+                    };
                     let result = mcts_root(&mut pos, &limits, &stop, eval, Some(&mut |p| {
                         let mut l = live.lock().unwrap();
                         *l = LiveInfo {
@@ -246,6 +264,10 @@ impl ChessApp {
                 return;
             }
             self.active = None;
+            if self.analyzing {
+                // Analyse : garder le plateau, laisser les stats affichées.
+                return;
+            }
             self.apply(m);
         }
     }
@@ -273,9 +295,15 @@ impl ChessApp {
         self.stop_search();
         self.gen += 1;
         self.apply(m);
+        if self.analyzing {
+            self.analysis_pending = true;
+        }
     }
 
     fn human_has_turn(&self) -> bool {
+        if self.analyzing {
+            return true;
+        }
         match self.mode {
             Mode::HumanHuman => true,
             Mode::HumanEngine => self.pos.side == WHITE,
@@ -284,13 +312,20 @@ impl ChessApp {
     }
 
     fn maybe_engine_plays(&mut self) {
+        if self.analyzing {
+            if self.analysis_pending && !self.is_searching() && self.game_over.is_none() {
+                self.analysis_pending = false;
+                self.trigger_engine(true);
+            }
+            return;
+        }
         let engine_turn = match self.mode {
             Mode::HumanEngine => self.pos.side == BLACK,
             Mode::EngineEngine => true,
             Mode::HumanHuman => false,
         };
         if engine_turn && !self.is_searching() && self.game_over.is_none() {
-            self.trigger_engine();
+            self.trigger_engine(false);
         }
     }
 
@@ -376,6 +411,26 @@ impl ChessApp {
             }
         }
 
+        // analysis: best-move highlight + PV arrows
+        if self.analyzing && self.active.is_some() {
+            let info = self.live.lock().unwrap().clone_into_info();
+            if !info.pv.is_empty() {
+                let m0 = info.pv[0];
+                let tint = Color32::from_rgba_unmultiplied(80, 200, 80, 80);
+                for s in [m0.from(), m0.to()] {
+                    let r = Rect::from_min_size(to_xy(s), Vec2::splat(sq_px));
+                    painter.rect_filled(r, 0.0, tint);
+                }
+                let stroke = Stroke::new(5.0, Color32::from_rgba_unmultiplied(90, 210, 90, 200));
+                for m in info.pv.iter().take(3) {
+                    let a = to_xy(m.from()) + Vec2::splat(sq_px / 2.0);
+                    let b = to_xy(m.to()) + Vec2::splat(sq_px / 2.0);
+                    let dir = b - a;
+                    painter.arrow(a + dir * 0.12, dir * 0.76, stroke);
+                }
+            }
+        }
+
         // click handling
         if let Some(click) = resp.interact_pointer_pos() {
             let s = sq_at(click);
@@ -433,11 +488,22 @@ impl ChessApp {
             }
         });
         ui.horizontal(|ui| {
+            if ui.selectable_label(self.analyzing, "Analyse").clicked() {
+                self.analyzing = !self.analyzing;
+                self.stop_search();
+                self.gen += 1;
+                if self.analyzing {
+                    self.analysis_pending = true;
+                    self.status = "Mode analyse : jouez un coup des deux côtés".to_owned();
+                } else {
+                    self.status = String::new();
+                }
+            }
             if ui.button("Arrêter").clicked() {
                 self.stop_search();
             }
             if ui.button("Réfléchir").clicked() && self.game_over.is_none() {
-                self.trigger_engine();
+                self.trigger_engine(false);
             }
         });
 
@@ -506,7 +572,26 @@ impl ChessApp {
 
         ui.separator();
         ui.label("Moteur");
+        if self.analyzing {
+            ui.colored_label(Color32::from_rgb(120, 200, 255), "mode analyse actif");
+        }
         let info = self.live.lock().unwrap().clone_into_info();
+        let frac = if info.mcts {
+            info.value
+        } else {
+            ((info.score as f32 + 6000.0) / 12000.0).clamp(0.0, 1.0)
+        };
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(200.0, 14.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 3.0, Color32::from_gray(40));
+        if frac > 0.0 {
+            painter.rect_filled(
+                egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, rect.height())),
+                3.0,
+                Color32::WHITE,
+            );
+        }
+        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, Color32::from_gray(110)), egui::StrokeKind::Inside);
         if self.active.is_some() {
             ui.colored_label(Color32::from_rgb(120, 220, 120), "● recherche en cours");
         } else {
