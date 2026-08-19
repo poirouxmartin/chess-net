@@ -4,6 +4,7 @@ pub mod attack;
 pub mod bitboard;
 pub mod evaluate;
 pub mod magic;
+pub mod mcts;
 pub mod move_;
 pub mod movegen;
 pub mod perft;

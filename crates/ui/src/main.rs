@@ -8,6 +8,7 @@ use eframe::egui::{
 };
 
 use engine::evaluate::{evaluate, MATE};
+use engine::mcts::{cp_from_prob, mcts_root, MctsLimits};
 use engine::move_::Move;
 use engine::movegen::generate_legal;
 use engine::position::{BLACK, Position, WHITE};
@@ -30,6 +31,12 @@ enum Mode {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+enum SearchKind {
+    AlphaBeta,
+    Mcts,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 enum GameKind {
     New,
     Setup,
@@ -37,11 +44,15 @@ enum GameKind {
 
 #[derive(Default)]
 struct LiveInfo {
+    mcts: bool,
+    playouts: u64,
+    value: f32,
     depth: i32,
     score: i32,
     nodes: u64,
     time_ms: u64,
     pv: Vec<Move>,
+    mcts_visits: Vec<(Move, u32)>,
 }
 
 struct ChessApp {
@@ -55,6 +66,7 @@ struct ChessApp {
     check_sq: Option<usize>,
     game_over: Option<String>,
     mode: Mode,
+    search_kind: SearchKind,
     flip: bool,
     movetime_ms: u64,
     eval_kind: EvalKind,
@@ -86,6 +98,7 @@ impl ChessApp {
             check_sq: None,
             game_over: None,
             mode: Mode::HumanEngine,
+            search_kind: SearchKind::AlphaBeta,
             flip: false,
             movetime_ms: 1000,
             eval_kind: EvalKind::PeSTO,
@@ -182,20 +195,48 @@ impl ChessApp {
         let eval = self.eval_fn;
         let ms = self.movetime_ms;
         let gen = self.gen;
+        let kind = self.search_kind;
         self.active = Some(gen);
         *self.live.lock().unwrap() = LiveInfo::default();
         std::thread::spawn(move || {
-            let mut searcher = Searcher::new(64);
-            let limits = Limits { movetime: Some(ms), ..Default::default() };
-            let result = searcher.think_cb(&mut pos, &limits, &stop, eval, Some(&mut |it: &SearchIter| {
-                let mut l = live.lock().unwrap();
-                l.depth = it.depth;
-                l.score = it.score;
-                l.nodes = it.nodes;
-                l.time_ms = it.time_ms;
-                l.pv = it.pv.clone();
-            }));
-            let _ = tx.send((gen, result.best));
+            let best = match kind {
+                SearchKind::AlphaBeta => {
+                    let mut searcher = Searcher::new(64);
+                    let limits = Limits { movetime: Some(ms), ..Default::default() };
+                    let result = searcher.think_cb(&mut pos, &limits, &stop, eval, Some(&mut |it: &SearchIter| {
+                        let mut l = live.lock().unwrap();
+                        *l = LiveInfo {
+                            mcts: false,
+                            depth: it.depth,
+                            score: it.score,
+                            nodes: it.nodes,
+                            time_ms: it.time_ms,
+                            pv: it.pv.clone(),
+                            ..LiveInfo::default()
+                        };
+                    }));
+                    result.best
+                }
+                SearchKind::Mcts => {
+                    let limits = MctsLimits { playouts: None, movetime: Some(ms) };
+                    let result = mcts_root(&mut pos, &limits, &stop, eval, Some(&mut |p| {
+                        let mut l = live.lock().unwrap();
+                        *l = LiveInfo {
+                            mcts: true,
+                            playouts: p.playouts,
+                            value: p.value,
+                            score: cp_from_prob(p.value),
+                            nodes: p.playouts,
+                            time_ms: p.time_ms,
+                            pv: p.moves.iter().map(|(m, _)| *m).collect(),
+                            mcts_visits: p.moves.clone(),
+                            ..LiveInfo::default()
+                        };
+                    }));
+                    result.best
+                }
+            };
+            let _ = tx.send((gen, best));
         });
     }
 
@@ -414,6 +455,16 @@ impl ChessApp {
                 ui.selectable_value(&mut self.mode, Mode::EngineEngine, "Moteur vs Moteur");
             });
         ui.add(egui::Slider::new(&mut self.movetime_ms, 50..=5000).text("temps/coup (ms)"));
+        ui.label("Recherche");
+        ComboBox::from_id_salt("search")
+            .selected_text(match self.search_kind {
+                SearchKind::AlphaBeta => "Alpha-beta (PVS)",
+                SearchKind::Mcts => "MCTS (NN)",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.search_kind, SearchKind::AlphaBeta, "Alpha-beta (PVS)");
+                ui.selectable_value(&mut self.search_kind, SearchKind::Mcts, "MCTS (NN)");
+            });
 
         ui.separator();
         ui.label("Évaluation");
@@ -458,6 +509,24 @@ impl ChessApp {
         let info = self.live.lock().unwrap().clone_into_info();
         if self.active.is_some() {
             ui.colored_label(Color32::from_rgb(120, 220, 120), "● recherche en cours");
+        } else {
+            ui.label("○ au repos");
+        }
+        if info.mcts {
+            ui.horizontal(|ui| {
+                ui.label(format!("plouts {}", fmt_u64(info.playouts)));
+                ui.label(format!("{:.1} s", info.time_ms as f32 / 1000.0));
+            });
+            ui.label(format!("P(gagne) {:.1}%", info.value * 100.0));
+            ui.label(format!("score {}", fmt_score(info.score)));
+            ui.monospace(
+                info.mcts_visits
+                    .iter()
+                    .map(|(m, v)| format!("{} {}", m.to_uci(), v))
+                    .collect::<Vec<_>>()
+                    .join("  "),
+            );
+        } else {
             ui.horizontal(|ui| {
                 ui.label(format!("prof {}", info.depth));
                 ui.label(format!("nœuds {}", fmt_u64(info.nodes)));
@@ -465,8 +534,6 @@ impl ChessApp {
             });
             ui.label(format!("score {}", fmt_score(info.score)));
             ui.monospace(format!("PV  {}", info.pv.iter().map(|m| m.to_uci()).collect::<Vec<_>>().join(" ")));
-        } else {
-            ui.label("○ au repos");
         }
 
         ui.separator();
@@ -506,11 +573,15 @@ impl ChessApp {
 impl LiveInfo {
     fn clone_into_info(&self) -> LiveInfo {
         LiveInfo {
+            mcts: self.mcts,
+            playouts: self.playouts,
+            value: self.value,
             depth: self.depth,
             score: self.score,
             nodes: self.nodes,
             time_ms: self.time_ms,
             pv: self.pv.clone(),
+            mcts_visits: self.mcts_visits.clone(),
         }
     }
 }
