@@ -7,8 +7,8 @@ use eframe::egui::{
     self, Align2, Color32, ComboBox, FontId, Pos2, Rect, Sense, Stroke, Vec2,
 };
 
-use engine::evaluate::{evaluate, MATE};
-use engine::mcts::{cp_from_prob, mcts_parallel, MctsLimits};
+use engine::evaluate::{evaluate, evaluate_breakdown, MATE};
+use engine::mcts::{cp_from_prob, mcts_parallel, wdl_from_q, MctsLimits};
 use engine::move_::Move;
 use engine::movegen::generate_legal;
 use engine::position::{BLACK, Position, WHITE};
@@ -17,6 +17,7 @@ use engine::search::{Limits, MultiLine, SearchIter, Searcher};
 
 const BOARD_PX: f32 = 640.0;
 const BOARD_BG: Color32 = Color32::from_rgb(45, 45, 48);
+const PIECE_NAMES: [&str; 6] = ["P", "N", "B", "R", "Q", "K"];
 
 #[derive(Clone, Copy, PartialEq)]
 enum EvalKind {
@@ -60,6 +61,8 @@ struct LiveInfo {
     score: i32,
     nodes: u64,
     time_ms: u64,
+    mates: u64,
+    draws: u64,
     pv: Vec<Move>,
     lines: Vec<LiveLine>,
 }
@@ -81,6 +84,7 @@ struct ChessApp {
     flip: bool,
     movetime_ms: u64,
     mcts_threads: usize,
+    mcts_analysis_ms: u64,
     eval_kind: EvalKind,
     nn_file: String,
     nn_error: Option<String>,
@@ -116,6 +120,7 @@ impl ChessApp {
             flip: false,
             movetime_ms: 1000,
             mcts_threads: 0,
+            mcts_analysis_ms: 2000,
             eval_kind: EvalKind::PeSTO,
             nn_file: String::new(),
             nn_error: None,
@@ -226,6 +231,7 @@ impl ChessApp {
         let eval = self.eval_fn;
         let ms = self.movetime_ms;
         let mcts_threads = self.mcts_threads;
+        let mcts_analysis_ms = self.mcts_analysis_ms;
         let gen = self.gen;
         let kind = self.search_kind;
         self.active = Some(gen);
@@ -258,7 +264,7 @@ impl ChessApp {
                 }
                 SearchKind::Mcts => {
                     let limits = if analysis {
-                        MctsLimits { playouts: None, movetime: Some(2000), threads: mcts_threads }
+                        MctsLimits { playouts: None, movetime: Some(mcts_analysis_ms), threads: mcts_threads }
                     } else {
                         MctsLimits { playouts: None, movetime: Some(ms), threads: mcts_threads }
                     };
@@ -271,6 +277,8 @@ impl ChessApp {
                             score: cp_from_prob(p.value),
                             nodes: p.playouts,
                             time_ms: p.time_ms,
+                            mates: p.mates,
+                            draws: p.draws,
                             pv: p.moves.iter().map(|(m, _)| *m).collect(),
                             lines: p
                                 .moves
@@ -370,6 +378,36 @@ impl ChessApp {
         if engine_turn && !self.is_searching() && self.game_over.is_none() {
             self.trigger_engine(false);
         }
+    }
+
+    fn static_eval_panel(&mut self, ui: &mut egui::Ui) {
+        let b = evaluate_breakdown(&self.view_pos());
+        egui::CollapsingHeader::new("Éval statique").default_open(false).show(ui, |ui| {
+            ui.monospace(format!("score (au trait): {:+.0} cp", b.score));
+            ui.monospace(format!("tapered: {:+.0} cp | phase: {}/24 | tempo: +{}", b.tapered, b.phase, b.tempo));
+            let w_mat: i32 = (0..6).map(|pt| b.detail[WHITE][pt].material).sum();
+            let b_mat: i32 = (0..6).map(|pt| b.detail[BLACK][pt].material).sum();
+            let w_pst = b.tapered - (w_mat - b_mat);
+            ui.monospace(format!(
+                "matériel: B {:+} / N {:+} | diff {:+}",
+                w_mat, b_mat, w_mat - b_mat
+            ));
+            ui.monospace(format!("PST (moyenné): {:+} cp", w_pst));
+            ui.separator();
+            for pt in 0..6 {
+                let w = b.detail[WHITE][pt];
+                let bl = b.detail[BLACK][pt];
+                if w.count == 0 && bl.count == 0 {
+                    continue;
+                }
+                ui.monospace(format!(
+                    "{}  B x{} mat{:+} pst{:+}/{:+}   N x{} mat{:+} pst{:+}/{:+}",
+                    PIECE_NAMES[pt],
+                    w.count, w.material, w.pst_mg, w.pst_eg,
+                    bl.count, bl.material, bl.pst_mg, bl.pst_eg,
+                ));
+            }
+        });
     }
 
     fn draw_board(&mut self, ui: &mut egui::Ui) {
@@ -660,6 +698,7 @@ impl ChessApp {
             });
         if self.search_kind == SearchKind::Mcts {
             ui.add(egui::Slider::new(&mut self.mcts_threads, 0..=32).text("threads MCTS (0 = auto)"));
+            ui.add(egui::Slider::new(&mut self.mcts_analysis_ms, 100..=60000).text("temps analyse MCTS (ms)"));
         }
 
         ui.separator();
@@ -692,6 +731,7 @@ impl ChessApp {
         } else {
             self.eval_fn = evaluate;
         }
+        self.static_eval_panel(ui);
 
         ui.separator();
         ui.label("Position (FEN)");
@@ -734,6 +774,12 @@ impl ChessApp {
             });
             ui.label(format!("{:.0} plouts/s", nps(info.playouts, info.time_ms)));
             ui.label(format!("P(gagne) {:.1}%", info.value * 100.0));
+            let q = 2.0 * info.value - 1.0;
+            let (w, d, l) = wdl_from_q(q);
+            ui.label(format!("WDL {:.1}% / {:.1}% / {:.1}%", w * 100.0, d * 100.0, l * 100.0));
+            if info.mates + info.draws > 0 {
+                ui.label(format!("terminaux: {} mat, {} nulle", info.mates, info.draws));
+            }
             ui.label(format!("score {}", fmt_score(info.score)));
         } else {
             ui.horizontal(|ui| {
@@ -838,6 +884,8 @@ impl LiveInfo {
             score: self.score,
             nodes: self.nodes,
             time_ms: self.time_ms,
+            mates: self.mates,
+            draws: self.draws,
             pv: self.pv.clone(),
             lines: self.lines.clone(),
         }

@@ -1,14 +1,22 @@
 //! Classical tapered evaluation: material + piece-square tables.
-//! White-perspective PSTs, black squares mirrored at lookup time.
+//! White-perspective PSTs, "rank 8 first" layout. For a white piece at engine
+//! square `sq` the table index is `mirror_sq(sq)`; for a black piece it is
+//! `sq` itself (mirror the square to white perspective, then mirror again).
 
 use crate::bitboard::mirror_sq;
 use crate::position::*;
+
+/// PST lookup index for a piece of color `c` on engine square `sq`.
+#[inline(always)]
+pub(crate) fn pst_index(c: usize, sq: usize) -> usize {
+    if c == WHITE { mirror_sq(sq) } else { sq }
+}
 
 pub const MATE: i32 = 32_000;
 pub const INF: i32 = 32_100;
 
 pub const MATERIAL: [i32; 6] = [100, 320, 330, 500, 900, 0];
-const TEMPO: i32 = 24;
+pub const TEMPO: i32 = 24;
 const PHASE_TOTAL: i32 = 24;
 
 // PeSTO tables, white perspective, rank 8 first.
@@ -155,9 +163,9 @@ pub fn evaluate(pos: &Position) -> i32 {
             let mut b = pos.piece_bb(c, pt);
             while b != 0 {
                 let sq = crate::bitboard::pop_lsb(&mut b);
-                let s = if c == WHITE { sq } else { mirror_sq(sq) };
+                let s = pst_index(c, sq);
                 mg += sign * (MATERIAL[pt] + pst(false, pt, s));
-                eg += sign * pst(true, pt, s);
+                eg += sign * (MATERIAL[pt] + pst(true, pt, s));
                 match pt {
                     KNIGHT | BISHOP => phase += 1,
                     ROOK => phase += 2,
@@ -178,4 +186,62 @@ pub fn evaluate(pos: &Position) -> i32 {
 
 pub fn is_mate_score(score: i32) -> bool {
     score > MATE - 1000 || score < -MATE + 1000
+}
+
+/// Per-piece-type evaluation detail for one color (white perspective signs).
+#[derive(Clone, Copy, Default)]
+pub struct PieceEval {
+    pub count: i32,
+    pub material: i32,
+    pub pst_mg: i32,
+    pub pst_eg: i32,
+}
+
+/// Full static-evaluation breakdown, for debugging/UI display.
+#[derive(Clone, Copy)]
+pub struct EvalBreakdown {
+    /// Side-to-move score in centipawns (what `evaluate` returns).
+    pub score: i32,
+    /// Tapered score before tempo, white perspective.
+    pub tapered: i32,
+    /// Game phase 0..24 (0 = pure endgame).
+    pub phase: i32,
+    pub tempo: i32,
+    /// `[color][piece_type]`, white perspective (black negated).
+    pub detail: [[PieceEval; 6]; 2],
+}
+
+pub fn evaluate_breakdown(pos: &Position) -> EvalBreakdown {
+    let mut mg = 0i32;
+    let mut eg = 0i32;
+    let mut phase = 0i32;
+    let mut detail = [[PieceEval::default(); 6]; 2];
+    for &c in &[WHITE, BLACK] {
+        let sign = if c == WHITE { 1 } else { -1 };
+        for &pt in &[PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING] {
+            let mut b = pos.piece_bb(c, pt);
+            while b != 0 {
+                let sq = crate::bitboard::pop_lsb(&mut b);
+                let s = pst_index(c, sq);
+                let pst_mg = pst(false, pt, s);
+                let pst_eg = pst(true, pt, s);
+                detail[c][pt].count += 1;
+                detail[c][pt].material += MATERIAL[pt];
+                detail[c][pt].pst_mg += pst_mg;
+                detail[c][pt].pst_eg += pst_eg;
+                mg += sign * (MATERIAL[pt] + pst_mg);
+                eg += sign * (MATERIAL[pt] + pst_eg);
+                match pt {
+                    KNIGHT | BISHOP => phase += 1,
+                    ROOK => phase += 2,
+                    QUEEN => phase += 4,
+                    _ => {}
+                }
+            }
+        }
+    }
+    let phase = phase.min(PHASE_TOTAL);
+    let tapered = (mg * phase + eg * (PHASE_TOTAL - phase)) / PHASE_TOTAL;
+    let score = if pos.side == WHITE { tapered + TEMPO } else { -tapered + TEMPO };
+    EvalBreakdown { score, tapered, phase, tempo: TEMPO, detail }
 }

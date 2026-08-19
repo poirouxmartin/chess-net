@@ -39,6 +39,10 @@ pub struct MctsProgress {
     pub best: Move,
     /// Top moves by visits (at most 5), most-visited first.
     pub moves: Vec<(Move, u32)>,
+    /// Playouts that ended in a checkmate.
+    pub mates: u64,
+    /// Playouts that ended in a draw (stalemate or 50-move rule).
+    pub draws: u64,
     pub time_ms: u64,
 }
 
@@ -49,7 +53,19 @@ pub struct MctsResult {
     pub visits: Vec<(Move, u32)>,
     /// Win probability for the side to move (from the most-visited child).
     pub value: f32,
+    /// Playouts that ended in a checkmate.
+    pub mates: u64,
+    /// Playouts that ended in a draw (stalemate or 50-move rule).
+    pub draws: u64,
     pub time_ms: u64,
+}
+
+/// Rough win/draw/loss probabilities from a zero-sum value `q` in [-1, 1].
+/// The draw probability peaks near equality and vanishes at decisive scores.
+pub fn wdl_from_q(q: f32) -> (f32, f32, f32) {
+    let win_raw = (q + 1.0) / 2.0;
+    let draw = 0.6 * (1.0 - q.abs());
+    (win_raw * (1.0 - draw), draw, (1.0 - win_raw) * (1.0 - draw))
 }
 
 /// Win-probability scaling: `sigmoid(cp / 400)`.
@@ -72,7 +88,7 @@ pub fn cp_from_prob(p: f32) -> i32 {
 
 /// Zero-sum score to win probability for the side to move.
 #[inline]
-fn q_to_prob(q: f32) -> f32 {
+pub fn q_to_prob(q: f32) -> f32 {
     (q + 1.0) * 0.5
 }
 
@@ -150,13 +166,17 @@ fn pack(value: i32, visits: u32) -> u64 {
 struct Tree {
     nodes: Box<[Node]>,
     len: AtomicU32,
+    /// Playouts that ended in a checkmate.
+    mates: AtomicU64,
+    /// Playouts that ended in a draw (stalemate or 50-move rule).
+    draws: AtomicU64,
 }
 
 impl Tree {
     /// Allocates the arena (the root is node 0) and preallocates `cap` slots.
     fn new(cap: usize) -> Self {
         let nodes: Box<[Node]> = (0..cap).map(|_| Node::new()).collect::<Vec<_>>().into_boxed_slice();
-        let tree = Tree { nodes, len: AtomicU32::new(0) };
+        let tree = Tree { nodes, len: AtomicU32::new(0), mates: AtomicU64::new(0), draws: AtomicU64::new(0) };
         tree.alloc(); // root, id 0
         tree
     }
@@ -353,11 +373,21 @@ fn playout(tree: &Tree, pos: &mut Position, value_fn: ValueFn) {
         ply += 1;
     }
 
-    // Leaf: fixed terminal result, depth-cap evaluation, or expand + evaluate.
+// Leaf: fixed terminal result, depth-cap evaluation, or expand + evaluate.
     // `v_leaf` is the zero-sum outcome for the side to move at the leaf.
     let node = tree.node(idx);
     let v_leaf = if node.terminal.load(Ordering::Acquire) {
-        if pos.in_check() { -1.0 } else { 0.0 }
+        if pos.in_check() {
+            tree.mates.fetch_add(1, Ordering::Relaxed);
+            -1.0
+        } else {
+            tree.draws.fetch_add(1, Ordering::Relaxed);
+            0.0
+        }
+    } else if pos.halfmove >= 100 {
+        // 50-move rule: the position is drawn.
+        tree.draws.fetch_add(1, Ordering::Relaxed);
+        0.0
     } else if node.n_children.load(Ordering::Acquire) > 0 {
         // Internal node reached through the depth cap: evaluate as a leaf.
         score_from_cp(value_fn(pos))
@@ -399,11 +429,13 @@ pub fn mcts_root(
     let legal = generate_legal(pos);
     if legal.len == 0 {
         let value = if pos.in_check() { 0.0 } else { 0.5 };
-        return MctsResult {
+return MctsResult {
             best: Move::null(),
             playouts: 0,
             visits: Vec::new(),
             value,
+            mates: 0,
+            draws: 0,
             time_ms: start.elapsed().as_millis() as u64,
         };
     }
@@ -437,11 +469,13 @@ pub fn mcts_root(
             let value = q_to_prob(tree.node(best_id).q());
             let moves = tree.visits_of(ROOT_ID);
             if let Some(cb) = on_progress.as_mut() {
-                cb(&MctsProgress {
+cb(&MctsProgress {
                     playouts,
                     value,
                     best: tree.node(best_id).mv(),
                     moves: moves.into_iter().take(5).collect(),
+                    mates: tree.mates.load(Ordering::Relaxed),
+                    draws: tree.draws.load(Ordering::Relaxed),
                     time_ms: start.elapsed().as_millis() as u64,
                 });
             }
@@ -450,11 +484,13 @@ pub fn mcts_root(
 
     let best_id = tree.best_child(ROOT_ID);
     let value = q_to_prob(tree.node(best_id).q());
-    MctsResult {
+MctsResult {
         best: tree.node(best_id).mv(),
         playouts,
         visits: tree.visits_of(ROOT_ID),
         value,
+        mates: tree.mates.load(Ordering::Relaxed),
+        draws: tree.draws.load(Ordering::Relaxed),
         time_ms: start.elapsed().as_millis() as u64,
     }
 }
@@ -476,11 +512,13 @@ pub fn mcts_parallel(
     let legal = generate_legal(pos);
     if legal.len == 0 {
         let value = if pos.in_check() { 0.0 } else { 0.5 };
-        return MctsResult {
+return MctsResult {
             best: Move::null(),
             playouts: 0,
             visits: Vec::new(),
             value,
+            mates: 0,
+            draws: 0,
             time_ms: start.elapsed().as_millis() as u64,
         };
     }
@@ -538,11 +576,13 @@ let counter = counter.clone();
                 break;
             }
             let (best, value, moves) = merge_trees(&trees);
-            cb(&MctsProgress {
+cb(&MctsProgress {
                 playouts: counter.load(Ordering::Relaxed),
                 value,
                 best,
                 moves: moves.into_iter().take(5).collect(),
+                mates: trees.iter().map(|t| t.mates.load(Ordering::Relaxed)).sum(),
+                draws: trees.iter().map(|t| t.draws.load(Ordering::Relaxed)).sum(),
                 time_ms: start.elapsed().as_millis() as u64,
             });
         }
@@ -553,11 +593,13 @@ let counter = counter.clone();
     }
 
     let (best, value, visits) = merge_trees(&trees);
-    MctsResult {
+MctsResult {
         best,
         playouts: counter.load(Ordering::Relaxed),
         visits,
         value,
+        mates: trees.iter().map(|t| t.mates.load(Ordering::Relaxed)).sum(),
+        draws: trees.iter().map(|t| t.draws.load(Ordering::Relaxed)).sum(),
         time_ms: start.elapsed().as_millis() as u64,
     }
 }
@@ -602,3 +644,4 @@ fn merge_trees(trees: &[Arc<Tree>]) -> (Move, f32, Vec<(Move, u32)>) {
     let q = (q_sum.get(&best).copied().unwrap_or(0.0) / total).clamp(-1.0, 1.0) as f32;
     (best, q_to_prob(q), sorted)
 }
+
