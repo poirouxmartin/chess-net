@@ -460,3 +460,116 @@ pub fn generate_captures(pos: &Position) -> MoveList {
     }
     out
 }
+
+/// Pseudo-legal move generation without pin/check filtering. Legality must be
+/// verified by the caller (make the move, then check the mover's king is not
+/// attacked). `captures_only` limits generation to captures + promotions + en
+/// passant (quiescence); when `in_check`, quiescence needs quiet evasions too,
+/// so the caller passes `captures_only = !in_check`. Castling is generated
+/// only when not in check and its path squares are already validated.
+pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> MoveList {
+    let us = pos.side;
+    let them = us ^ 1;
+    let k = pos.king_sq[us];
+    let occ = pos.occ;
+    let enemies = pos.pieces_of(them);
+    let empty = !occ;
+    let targets = empty | enemies;
+    let mut list = MoveList::new();
+
+    // ---- King moves ----
+    let mut kb = king_attacks(k) & targets;
+    while kb != 0 {
+        let sq = pop_lsb(&mut kb);
+        let is_cap = enemies & bit(sq) != 0;
+        if !captures_only || is_cap {
+            let flags = if is_cap { FLAG_CAPTURE } else { FLAG_QUIET };
+            list.push(Move::new(k, sq, 0, flags).with_piece(KING));
+        }
+    }
+
+    // ---- Castling (quiet; square safety already checked by gen_castling) ----
+    if !captures_only && !in_check {
+        gen_castling(pos, &mut list, occ, occ & !bit(k), them);
+    }
+
+    // ---- Pawns ----
+    let mut pb = pos.piece_bb(us, PAWN);
+    let forward: i32 = if us == WHITE { 8 } else { -8 };
+    let promo_rank: usize = if us == WHITE { 7 } else { 0 };
+    let start_rank: usize = if us == WHITE { 1 } else { 6 };
+    while pb != 0 {
+        let sq = pop_lsb(&mut pb);
+
+        if !captures_only {
+            if let Some(ps) = step_sq(sq, forward) {
+                if empty & bit(ps) != 0 {
+                    if rank_of(ps) == promo_rank {
+                        for p in [PROMO_QUEEN, PROMO_ROOK, PROMO_BISHOP, PROMO_KNIGHT] {
+                            list.push(Move::new(sq, ps, p, FLAG_PROMO).with_piece(PAWN));
+                        }
+                    } else {
+                        list.push(Move::new(sq, ps, 0, FLAG_QUIET).with_piece(PAWN));
+                        if rank_of(sq) == start_rank {
+                            if let Some(ps2) = step_sq(ps, forward) {
+                                if empty & bit(ps2) != 0 {
+                                    list.push(Move::new(sq, ps2, 0, FLAG_DOUBLE).with_piece(PAWN));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cb = pawn_attacks(us, sq) & enemies;
+        while cb != 0 {
+            let t = pop_lsb(&mut cb);
+            if rank_of(t) == promo_rank {
+                for p in [PROMO_QUEEN, PROMO_ROOK, PROMO_BISHOP, PROMO_KNIGHT] {
+                    list.push(Move::new(sq, t, p, FLAG_PROMO_CAPTURE).with_piece(PAWN));
+                }
+            } else {
+                list.push(Move::new(sq, t, 0, FLAG_CAPTURE).with_piece(PAWN));
+            }
+        }
+
+        // En passant: pseudo-legal here; legality (king safe after both pawns
+        // are gone) is verified lazily by the caller.
+        if let Some(ep) = pos.ep {
+            if pawn_attacks(us, sq) & bit(ep) != 0 {
+                list.push(Move::new(sq, ep, 0, FLAG_EN_PASSANT).with_piece(PAWN));
+            }
+        }
+    }
+
+    // ---- Knights ----
+    let mut kb = pos.piece_bb(us, KNIGHT);
+    while kb != 0 {
+        let sq = pop_lsb(&mut kb);
+        let mut tb = knight_attacks(sq) & targets;
+        while tb != 0 {
+            let t = pop_lsb(&mut tb);
+            if !captures_only || enemies & bit(t) != 0 {
+                push_simple(&mut list, sq, t, enemies, KNIGHT);
+            }
+        }
+    }
+
+    // ---- Bishops / rooks / queens ----
+    for pt in [BISHOP, ROOK, QUEEN] {
+        let mut sb = pos.piece_bb(us, pt);
+        while sb != 0 {
+            let sq = pop_lsb(&mut sb);
+            let mut tb = sliding_attacks(pt, sq, occ) & targets;
+            while tb != 0 {
+                let t = pop_lsb(&mut tb);
+                if !captures_only || enemies & bit(t) != 0 {
+                    push_simple(&mut list, sq, t, enemies, pt);
+                }
+            }
+        }
+    }
+
+    list
+}

@@ -504,6 +504,14 @@ impl Position {
         self.square_attacked(self.king_sq[self.side], self.side ^ 1, self.occ & !bit(self.king_sq[self.side]))
     }
 
+    /// After `make_move` by side `us`, is the king of `us` attacked by the new
+    /// side to move (`us ^ 1`)? Used for lazy move legality.
+    #[inline(always)]
+    pub fn king_safe(&self, us: usize) -> bool {
+        let k = self.king_sq[us];
+        !self.square_attacked(k, us ^ 1, self.occ & !bit(k))
+    }
+
     /// Squares of enemy pieces giving check to the side to move.
     pub fn checkers(&self) -> u64 {
         let us = self.side;

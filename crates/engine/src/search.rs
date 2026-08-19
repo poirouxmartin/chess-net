@@ -1,12 +1,13 @@
-﻿//! Alpha-beta search: iterative deepening, PVS, quiescence, TT, killers,
+//! Alpha-beta search: iterative deepening, PVS, quiescence, TT, killers,
 //! history heuristic, null-move pruning, time management.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::cmp::Reverse;
 use std::time::{Duration, Instant};
 
+use crate::bitboard::bit;
 use crate::evaluate::{MATE, INF};
-use crate::movegen::{generate_captures, generate_legal, MoveList};
+use crate::movegen::{generate_legal, generate_pseudo, MoveList};
 use crate::move_::Move;
 use crate::position::*;
 use crate::tt::{TT, FLAG_EXACT, FLAG_LOWER, FLAG_UPPER};
@@ -66,6 +67,9 @@ struct RootResult {
 
 pub struct Searcher {
     pub tt: TT,
+    /// When false, the transposition table is ignored (probe/store bypassed).
+    /// Used for A/B correctness checks and fair speed comparisons.
+    pub use_tt: bool,
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
     pv_table: Box<[[Move; MAX_PLY]; MAX_PLY]>,
@@ -73,6 +77,7 @@ pub struct Searcher {
     nodes: u64,
     start: Instant,
     budget: Duration,
+    /// Keys of the positions in the current line (pushed after each move).
     key_hist: Vec<u64>,
 }
 
@@ -82,6 +87,7 @@ impl Searcher {
     pub fn new(hash_mb: usize) -> Self {
         Searcher {
             tt: TT::new(hash_mb),
+            use_tt: true,
             killers: [[Move::null(); 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             pv_table: Box::new([[Move::null(); MAX_PLY]; MAX_PLY]),
@@ -111,6 +117,7 @@ impl Searcher {
         self.start = Instant::now();
         self.nodes = 0;
         self.key_hist.clear();
+
         for k in &mut self.killers {
             *k = [Move::null(); 2];
         }
@@ -170,7 +177,7 @@ impl Searcher {
 
     fn root_search(&mut self, pos: &mut Position, depth: i32, stop: &AtomicBool, eval: EvalFn) -> RootResult {
         let mut moves = generate_legal(pos);
-        let tt_move = self.tt.probe(pos.key).map(|e| Move(e.mv));
+        let tt_move = if self.use_tt { self.tt.probe(pos.key).map(|e| Move(e.mv)) } else { None };
         self.order_moves(pos, &mut moves, tt_move, 0);
 
         if moves.len == 0 {
@@ -210,9 +217,8 @@ impl Searcher {
                 best_move = m;
                 self.pv_table[0][0] = m;
                 let len = self.pv_len[1];
-                let mut tmp = [Move::null(); MAX_PLY];
-                tmp[..len].copy_from_slice(&self.pv_table[1][..len]);
-                self.pv_table[0][1..1 + len].copy_from_slice(&tmp[..len]);
+                let (left, right) = self.pv_table.split_at_mut(1);
+                left[0][1..1 + len].copy_from_slice(&right[0][..len]);
                 self.pv_len[0] = len + 1;
             }
         }
@@ -262,6 +268,29 @@ impl Searcher {
         lines
     }
 
+    /// Convert a node score to a root-relative TT score: mate scores depend on
+    /// the ply at which they were produced, so they are stored relative to the
+    /// root and restored relative to the retrieving node's ply.
+    fn score_to_tt(score: i32, ply: usize) -> i32 {
+        if score >= MATE - MAX_PLY as i32 {
+            score + ply as i32
+        } else if score <= -MATE + MAX_PLY as i32 {
+            score - ply as i32
+        } else {
+            score
+        }
+    }
+
+    fn score_from_tt(score: i32, ply: usize) -> i32 {
+        if score >= MATE - MAX_PLY as i32 {
+            score - ply as i32
+        } else if score <= -MATE + MAX_PLY as i32 {
+            score + ply as i32
+        } else {
+            score
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn negamax(
         &mut self,
@@ -283,7 +312,7 @@ impl Searcher {
         }
 
         if ply > 0 {
-            if pos.halfmove >= 100 || self.is_repetition(pos.key) {
+            if pos.halfmove >= 100 || self.is_repetition(pos.key, pos.halfmove) {
                 return 0;
             }
         }
@@ -294,19 +323,19 @@ impl Searcher {
         }
 
         let key = pos.key;
-        let tt_move = match self.tt.probe(key) {
+        let tt_move = match if self.use_tt { self.tt.probe(key) } else { None } {
             Some(e) => {
                 if ply > 0 && (e.depth as i32) >= depth {
                     match e.flag {
-                        FLAG_EXACT => return e.score,
+                        FLAG_EXACT => return Self::score_from_tt(e.score, ply),
                         FLAG_LOWER => {
                             if e.score >= beta {
-                                return e.score;
+                                return Self::score_from_tt(e.score, ply);
                             }
                         }
                         FLAG_UPPER => {
                             if e.score <= alpha {
-                                return e.score;
+                                return Self::score_from_tt(e.score, ply);
                             }
                         }
                         _ => {}
@@ -317,9 +346,13 @@ impl Searcher {
             None => None,
         };
 
-        if depth >= 3 && !in_check && pos.occ.count_ones() > 5 {
-            let e = eval(pos);
-            if e >= beta {
+        let occ_count = pos.occ.count_ones();
+        let mut eval_cache = 0i32;
+        let mut have_eval = false;
+        if depth >= 3 && !in_check && occ_count > 5 {
+            eval_cache = eval(pos);
+            have_eval = true;
+            if eval_cache >= beta {
                 pos.make_null();
                 let score = -self.negamax(pos, depth - 1 - 2, -beta, -beta + 1, ply + 1, stop, eval);
                 pos.unmake_null();
@@ -331,30 +364,97 @@ impl Searcher {
 
         // Reverse futility pruning: position is clearly above beta, skip movegen.
         if depth <= 7 && !in_check && ply > 0 {
-            let e = eval(pos);
-            if e - 90 * depth >= beta {
-                return e;
+            if !have_eval {
+                eval_cache = eval(pos);
+            }
+            if eval_cache - 90 * depth >= beta {
+                return eval_cache;
             }
         }
 
-        let mut moves = generate_legal(pos);
+        let us = pos.side;
+        let pinned = pos.pinned();
+        let king = pos.king_sq[us];
+
+        let mut best = -INF;
+        let mut best_move = Move::null();
+        let mut alpha0 = alpha;
+
+        // TT move first: searched before any movegen/ordering. A cutoff here
+        // skips generation entirely (the common cut-node case). The move is
+        // then skipped in the main loop; its score is already exact (it was
+        // searched with the full window).
+let mut searched: Option<Move> = None;
+        if let Some(tt_m) = tt_move {
+            // A TT move can be stale (entry from another position sharing the
+            // slot, or a null move stored by a buggy mate node): only search it
+            // when its `from` square actually holds a piece of the side to move.
+            if pos.pieces_of(us) & bit(tt_m.from()) != 0 {
+                let verify = in_check
+                || tt_m.is_en_passant()
+                || tt_m.from() == king
+                || (pinned & bit(tt_m.from()) != 0);
+            let undo = pos.make_move(tt_m);
+            if verify && !pos.king_safe(us) {
+                pos.unmake_move(undo);
+            } else {
+                self.key_hist.push(pos.key);
+                let s = -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval);
+                self.key_hist.pop();
+                pos.unmake_move(undo);
+                if stop.load(Ordering::Relaxed) {
+                    return 0;
+                }
+                if s > best {
+                    best = s;
+                    best_move = tt_m;
+                    if s > alpha0 {
+                        alpha0 = s;
+                        self.pv_table[ply][0] = tt_m;
+                        let len = self.pv_len[ply + 1];
+                        let (left, right) = self.pv_table.split_at_mut(ply + 1);
+                        left[ply][1..1 + len].copy_from_slice(&right[0][..len]);
+                        self.pv_len[ply] = len + 1;
+                    }
+                }
+                if alpha0 >= beta {
+                    if best_move.is_quiet() {
+                        self.update_history(pos, best_move, depth);
+                        if self.killers[ply][0] != best_move {
+                            self.killers[ply][1] = self.killers[ply][0];
+                            self.killers[ply][0] = best_move;
+                        }
+                    }
+                    if self.use_tt {
+                        self.tt.store(key, Self::score_to_tt(best, ply), depth, FLAG_LOWER, best_move);
+                    }
+                    return best;
+                }
+                searched = Some(tt_m);
+            }
+            }
+        }
+
+        let mut moves = generate_pseudo(pos, false, in_check);
         if moves.len == 0 {
             return if in_check { -MATE + ply as i32 } else { 0 };
         }
 
         self.order_moves(pos, &mut moves, tt_move, ply);
 
-        let mut best = -INF;
-        let mut best_move = Move::null();
-        let mut alpha0 = alpha;
-
         for i in 0..moves.len {
             let m = moves.get(i);
+            if searched == Some(m) {
+                continue;
+            }
+            // Reduction index: the skipped TT move occupied list slot 0, so
+            // restore the original numbering for LMR thresholds.
+            let idx = i + if searched.is_some() { 1 } else { 0 };
             // Late Move Reductions: cut depth for quiet moves searched late.
-            let reduction = if i > 0 && m.is_quiet() && !in_check && depth >= 3 {
-                if i >= 6 {
+            let reduction = if idx > 0 && m.is_quiet() && !in_check && depth >= 3 {
+                if idx >= 6 {
                     2
-                } else if i >= 3 {
+                } else if idx >= 3 {
                     1
                 } else {
                     0
@@ -362,9 +462,20 @@ impl Searcher {
             } else {
                 0
             };
+            // A move is unconditionally legal only for a non-pinned piece that
+            // is not the king (and not en passant); anything else is verified
+            // by making it and checking the mover's king afterwards.
+            let verify = in_check
+                || m.is_en_passant()
+                || m.from() == king
+                || (pinned & bit(m.from()) != 0);
             let undo = pos.make_move(m);
+            if verify && !pos.king_safe(us) {
+                pos.unmake_move(undo);
+                continue;
+            }
             self.key_hist.push(pos.key);
-            let s = if i == 0 {
+            let s = if i == 0 && searched.is_none() {
                 -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval)
             } else {
                 let s = -self.negamax(
@@ -394,9 +505,8 @@ impl Searcher {
                     alpha0 = s;
                     self.pv_table[ply][0] = m;
                     let len = self.pv_len[ply + 1];
-                    let mut tmp = [Move::null(); MAX_PLY];
-                    tmp[..len].copy_from_slice(&self.pv_table[ply + 1][..len]);
-                    self.pv_table[ply][1..1 + len].copy_from_slice(&tmp[..len]);
+                    let (left, right) = self.pv_table.split_at_mut(ply + 1);
+                    left[ply][1..1 + len].copy_from_slice(&right[0][..len]);
                     self.pv_len[ply] = len + 1;
                 }
             }
@@ -419,7 +529,15 @@ impl Searcher {
         } else {
             FLAG_EXACT
         };
-        self.tt.store(key, best, depth, flag, best_move);
+        if best == -INF {
+            // Every pseudo-move was illegal: the position is mate or
+            // stalemate even though generate_pseudo was non-empty. Without
+            // this the node would return -INF and store a null TT move.
+            return if in_check { -MATE + ply as i32 } else { 0 };
+        }
+        if self.use_tt {
+            self.tt.store(key, Self::score_to_tt(best, ply), depth, flag, best_move);
+        }
         best
     }
 
@@ -451,11 +569,7 @@ impl Searcher {
             }
         }
 
-        let mut moves = if in_check {
-            generate_legal(pos)
-        } else {
-            generate_captures(pos)
-        };
+        let mut moves = generate_pseudo(pos, !in_check, in_check);
         if moves.len == 0 {
             return if in_check { -MATE + ply as i32 } else { alpha };
         }
@@ -464,10 +578,21 @@ impl Searcher {
 
         let mut best = if in_check { -INF } else { alpha };
         let mut alpha0 = if in_check { -INF } else { alpha };
+        let us = pos.side;
+        let pinned = pos.pinned();
+        let king = pos.king_sq[us];
 
         for i in 0..moves.len {
             let m = moves.get(i);
+            let verify = in_check
+                || m.is_en_passant()
+                || m.from() == king
+                || (pinned & bit(m.from()) != 0);
             let undo = pos.make_move(m);
+            if verify && !pos.king_safe(us) {
+                pos.unmake_move(undo);
+                continue;
+            }
             let s = -self.quiescence(pos, -beta, -alpha0, ply + 1, stop, eval);
             pos.unmake_move(undo);
             if stop.load(Ordering::Relaxed) {
@@ -483,10 +608,13 @@ impl Searcher {
                 }
             }
         }
+        if best == -INF {
+            return if in_check { -MATE + ply as i32 } else { alpha };
+        }
         best
     }
 
-    fn order_moves(&mut self, pos: &Position, moves: &mut MoveList, tt_move: Option<Move>, ply: usize) {
+    pub fn order_moves(&mut self, pos: &Position, moves: &mut MoveList, tt_move: Option<Move>, ply: usize) {
         let mut scores = [0i32; 256];
         for i in 0..moves.len {
             scores[i] = self.move_score(pos, moves.get(i), tt_move, ply);
@@ -577,10 +705,16 @@ impl Searcher {
         }
     }
 
-    fn is_repetition(&self, key: u64) -> bool {
-        // key_hist includes the current position; a draw if it appeared before.
+    /// Repetition: the current key is in `key_hist` (pushed by the parent); a
+    /// draw when it appeared at least once before. Only the plies since the
+    /// last irreversible move (`halfmove`) are scanned: the same position
+    /// cannot recur across an irreversible move, so earlier entries cannot
+    /// match.
+    fn is_repetition(&self, key: u64, halfmove: u32) -> bool {
+        let len = self.key_hist.len();
+        let start = len.saturating_sub(halfmove as usize + 1);
         let mut count = 0;
-        for &h in self.key_hist.iter() {
+        for &h in &self.key_hist[start..] {
             if h == key {
                 count += 1;
                 if count >= 2 {

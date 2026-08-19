@@ -147,12 +147,13 @@ static PST_EG: [[i32; 64]; 6] = [
 ];
 
 #[inline(always)]
-fn pst(eg: bool, pt: usize, sq: usize) -> i32 {
+pub(crate) fn pst(eg: bool, pt: usize, sq: usize) -> i32 {
     let table = if eg { &PST_EG[pt] } else { &PST_MG[pt] };
     table[sq]
 }
 
 /// Static evaluation in centipawns from the side-to-move perspective.
+#[inline(always)]
 pub fn evaluate(pos: &Position) -> i32 {
     let mut mg = 0i32;
     let mut eg = 0i32;
