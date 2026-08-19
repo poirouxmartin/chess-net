@@ -151,7 +151,11 @@ fn encode_features(net: &Net, pos: &Position, out: &mut [usize]) -> usize {
     n
 }
 
-/// Evaluate the loaded model from the side-to-move perspective, in centipawns.
+/// Evaluate the loaded model from WHITE's perspective, in centipawns.
+///
+/// The features are side-agnostic (absolute colors), so the net's raw output
+/// is the white win prob/logit. The search needs side-to-move scores and must
+/// use [`evaluate_loaded_stm`] instead.
 pub fn evaluate_loaded(pos: &Position) -> i32 {
     let net = LOADED.get().expect("no model loaded");
     let mut feats = [0usize; MAX_ACTIVE];
@@ -181,6 +185,17 @@ pub fn evaluate_loaded(pos: &Position) -> i32 {
         out += net.wo[j] * h1[j];
     }
     (out * 400.0).round() as i32
+}
+
+/// Evaluate from the side to move's perspective (what the alpha-beta search
+/// expects): white's score when it is white to move, negated for black.
+pub fn evaluate_loaded_stm(pos: &Position) -> i32 {
+    let s = evaluate_loaded(pos);
+    if pos.side == 0 {
+        s
+    } else {
+        -s
+    }
 }
 
 #[inline(always)]

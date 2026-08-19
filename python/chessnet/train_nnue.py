@@ -3,7 +3,7 @@
 Dataset format (one position per line):
   <fen> <label>
 where label is the raw target for the net output:
-  --loss bce -> win probability for the side to move, in [0,1]
+  --loss bce -> win probability for WHITE, in [0,1]
   --loss mse -> score in centipawns / 400 (logit*400 == centipawns)
 
 Example lines:

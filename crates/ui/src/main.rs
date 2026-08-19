@@ -727,7 +727,7 @@ impl ChessApp {
             self.eval_kind = EvalKind::PeSTO;
         }
         if self.eval_kind == EvalKind::NN {
-            self.eval_fn = nn::evaluate_loaded;
+            self.eval_fn = nn::evaluate_loaded_stm;
         } else {
             self.eval_fn = evaluate;
         }

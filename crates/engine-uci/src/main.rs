@@ -13,7 +13,7 @@ fn on_option(name: &str, value: &str) -> bool {
         }
         match nn::load(value) {
             Ok(_) => {
-                engine::uci::set_eval(nn::evaluate_loaded);
+                engine::uci::set_eval(nn::evaluate_loaded_stm);
                 println!("info string eval file loaded: {value}");
                 true
             }

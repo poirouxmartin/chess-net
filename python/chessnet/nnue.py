@@ -44,7 +44,7 @@ class NNUE(nn.Module):
 
     @torch.no_grad()
     def evaluate(self, board, stm=True):
-        """Single-position logit from stm perspective (stm ignored for features)."""
+        """Single-position logit from WHITE's perspective."""
         if self.feat_count == HALFKP_FEAT_COUNT:
             feats = F.features_halfkp(board)
         else:
@@ -72,7 +72,7 @@ def encode_batch(boards, feat=FEAT_KP768):
 
 
 def train_epoch(model, loader, opt, device, loss_mode="bce", scale=1.0):
-    """One epoch. Labels: bce -> probability p (stm), mse -> centipawns/400."""
+    """One epoch. Labels: bce -> probability p (white), mse -> centipawns/400."""
     model.train()
     total = 0.0
     for idx, mask, y in loader:

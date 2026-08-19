@@ -2,7 +2,7 @@
 
 Output format (one position per line, compatible with train_nnue.py):
   <fen> <label>
-where label is the win probability for the side to move in [0,1].
+where label is the win probability for WHITE in [0,1] (1.0/0.5/0.0).
 
 Modes:
   random  -> games played with random moves (fast, low quality)
@@ -40,7 +40,7 @@ def _random_game(max_plies=400):
     else:
         white_result = 0.0
     return [
-        (b.fen(), (white_result if b.turn == chess.WHITE else -white_result + 1.0) / 2.0)
+        (b.fen(), (white_result + 1.0) / 2.0)
         for b in history
     ]
 
