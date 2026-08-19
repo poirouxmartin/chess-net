@@ -78,7 +78,9 @@ fn sliding_attacks(sq: usize, occ: u64, dirs: &[i32]) -> u64 {
 }
 
 fn find_magic(sq: usize, mask: u64, bits: u32) -> u64 {
-    let mut rng = SplitMix64::new(0x1BAD_5EEDu64.wrapping_add(sq as u64 * 0x9E3779B97F4A7C15));
+    let mut rng = SplitMix64::new(
+        0x1BAD_5EEDu64.wrapping_add((sq as u64).wrapping_mul(0x9E3779B97F4A7C15)),
+    );
     let n = 1usize << bits;
     let mut used = vec![0u64; n];
     loop {

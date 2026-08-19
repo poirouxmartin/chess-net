@@ -33,6 +33,15 @@ pub struct SearchResult {
     pub time_ms: u64,
 }
 
+/// Snapshot of one completed iterative-deepening iteration, for live UI.
+pub struct SearchIter {
+    pub depth: i32,
+    pub score: i32,
+    pub nodes: u64,
+    pub time_ms: u64,
+    pub pv: Vec<Move>,
+}
+
 struct RootResult {
     best: Move,
     score: i32,
@@ -68,6 +77,19 @@ impl Searcher {
     }
 
     pub fn think(&mut self, pos: &mut Position, limits: &Limits, stop: &AtomicBool, eval: EvalFn) -> SearchResult {
+        self.think_cb(pos, limits, stop, eval, None)
+    }
+
+    /// Like `think`, but calls `on_iter` after each completed depth iteration
+    /// with live (depth, score, nodes, pv). Used by GUIs to stream progress.
+    pub fn think_cb(
+        &mut self,
+        pos: &mut Position,
+        limits: &Limits,
+        stop: &AtomicBool,
+        eval: EvalFn,
+        mut on_iter: Option<&mut dyn FnMut(&SearchIter)>,
+    ) -> SearchResult {
         self.budget = compute_budget(pos, limits);
         self.start = Instant::now();
         self.nodes = 0;
@@ -95,6 +117,15 @@ impl Searcher {
             score = r.score;
             done = d as i32;
             pv = self.pv_table[0][..self.pv_len[0]].to_vec();
+            if let Some(cb) = on_iter.as_mut() {
+                cb(&SearchIter {
+                    depth: done,
+                    score,
+                    nodes: self.nodes,
+                    time_ms: self.start.elapsed().as_millis() as u64,
+                    pv: pv.clone(),
+                });
+            }
             if stop.load(Ordering::Relaxed) {
                 break;
             }

@@ -1,0 +1,10 @@
+[package]
+name = "chess-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+nn = { path = "../nn" }
+eframe = "0.36"
+egui = "0.36"
