@@ -1,7 +1,9 @@
 //! Alpha-beta search: iterative deepening, PVS, quiescence, TT, killers,
 //! history heuristic, null-move pruning, time management.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "profiling")]
+use std::sync::atomic::AtomicU64;
 use std::cmp::Reverse;
 use std::time::{Duration, Instant};
 
@@ -9,15 +11,16 @@ use crate::bitboard::{bit, pop_lsb};
 use crate::attack::{knight_attacks, pawn_attacks};
 use crate::magic::{bishop_attacks, queen_attacks, rook_attacks};
 use crate::evaluate::{MATE, INF};
-use crate::movegen::{generate_legal, generate_pseudo, MoveList};
+use crate::movegen::{generate_legal, generate_pseudo_into, MoveList};
 use crate::move_::Move;
 use crate::position::*;
 use crate::tt::{TT, FLAG_EXACT, FLAG_LOWER, FLAG_UPPER};
 
 pub const MAX_PLY: usize = 128;
 
-/// Temporary per-search counters (composition profiling). Not part of the
-/// engine contract; removed once the NPS bottleneck is identified.
+/// Per-search composition counters (compilation profiling), enabled with the
+/// `profiling` feature. Not part of the engine contract.
+#[cfg(feature = "profiling")]
 pub static PROF: Prof = Prof {
     negamax: AtomicU64::new(0),
     qnode: AtomicU64::new(0),
@@ -31,6 +34,7 @@ pub static PROF: Prof = Prof {
     rep: AtomicU64::new(0),
 };
 
+#[cfg(feature = "profiling")]
 pub struct Prof {
     pub negamax: AtomicU64,
     pub qnode: AtomicU64,
@@ -227,6 +231,11 @@ impl Searcher {
         let mut done = 0;
         let mut pv = Vec::new();
         let mut lines = Vec::new();
+        // Per-ply move buffers, reused by `generate_pseudo_into`. Threaded as a
+        // separate parameter (disjoint from `self`) so the parent's move list
+        // can stay alive while children are searched. One extra slot guards the
+        // deepest allowed ply.
+        let mut moves_pool = Box::new([MoveList::new(); MAX_PLY + 1]);
 
         let mut prev = 0i32;
         for d in 1..=max_depth {
@@ -243,7 +252,7 @@ impl Searcher {
             };
             let mut r;
             loop {
-                r = self.root_search(pos, d as i32, alpha, beta, stop, eval);
+                r = self.root_search(pos, d as i32, alpha, beta, stop, eval, &mut moves_pool[..]);
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -264,7 +273,7 @@ impl Searcher {
             prev = score;
             pv = self.pv_table[0][..self.pv_len[0]].to_vec();
             if multi > 1 {
-                lines = self.compute_multi_pv(pos, d as i32, stop, eval, multi);
+                lines = self.compute_multi_pv(pos, d as i32, stop, eval, multi, &mut moves_pool[..]);
             }
             if let Some(cb) = on_iter.as_mut() {
                 cb(&SearchIter {
@@ -295,7 +304,7 @@ impl Searcher {
         }
     }
 
-    fn root_search(&mut self, pos: &mut Position, depth: i32, alpha: i32, beta: i32, stop: &AtomicBool, eval: EvalFn) -> RootResult {
+    fn root_search(&mut self, pos: &mut Position, depth: i32, alpha: i32, beta: i32, stop: &AtomicBool, eval: EvalFn, pool: &mut [MoveList]) -> RootResult {
         let mut moves = generate_legal(pos);
         let tt_move = if self.use_tt { self.tt.probe(pos.key).map(|e| e.mv_move()) } else { None };
         self.order_moves(pos, &mut moves, tt_move, 0);
@@ -318,11 +327,11 @@ impl Searcher {
             self.key_hist[self.key_hist_len] = pos.key;
             self.key_hist_len += 1;
             let s = if i == 0 {
-                -self.negamax(pos, depth - 1, -beta, -alpha, 1, stop, eval)
+                -self.negamax(pos, depth - 1, -beta, -alpha, 1, stop, eval, pool)
             } else {
-                let s = -self.negamax(pos, depth - 1, -alpha - 1, -alpha, 1, stop, eval);
+                let s = -self.negamax(pos, depth - 1, -alpha - 1, -alpha, 1, stop, eval, pool);
                 if s > alpha && s < beta {
-                    -self.negamax(pos, depth - 1, -beta, -alpha, 1, stop, eval)
+                    -self.negamax(pos, depth - 1, -beta, -alpha, 1, stop, eval, pool)
                 } else {
                     s
                 }
@@ -360,6 +369,7 @@ impl Searcher {
         stop: &AtomicBool,
         eval: EvalFn,
         multi: usize,
+        pool: &mut [MoveList],
     ) -> Vec<MultiLine> {
         let mut moves = generate_legal(pos);
         if moves.len == 0 {
@@ -374,7 +384,7 @@ impl Searcher {
             let undo = pos.make_move(m);
             self.key_hist[self.key_hist_len] = pos.key;
             self.key_hist_len += 1;
-            let s = -self.negamax(pos, depth - 1, -INF, INF, 1, stop, eval);
+            let s = -self.negamax(pos, depth - 1, -INF, INF, 1, stop, eval, pool);
             self.key_hist_len -= 1;
             pos.unmake_move(undo);
             let mut pv = vec![m];
@@ -422,8 +432,10 @@ impl Searcher {
         ply: usize,
         stop: &AtomicBool,
         eval: EvalFn,
+        pool: &mut [MoveList],
     ) -> i32 {
         self.nodes += 1;
+        #[cfg(feature = "profiling")]
         PROF.negamax.fetch_add(1, Ordering::Relaxed);
         // Reset the PV slot first: any early return (time-up, TT cutoff,
         // null-move, RFP, quiescence, mate) leaves `pv_len[ply] == 0` so the
@@ -434,6 +446,7 @@ impl Searcher {
         }
 
         if ply > 0 {
+            #[cfg(feature = "profiling")]
             PROF.rep.fetch_add(1, Ordering::Relaxed);
             if pos.halfmove >= 100 || self.is_repetition(pos.key, pos.halfmove) {
                 return 0;
@@ -442,7 +455,7 @@ impl Searcher {
 
         let in_check = pos.in_check();
         if depth <= 0 && !in_check {
-            return self.quiescence(pos, alpha, beta, ply, stop, eval);
+            return self.quiescence(pos, alpha, beta, ply, stop, eval, pool);
         }
 
         let key = pos.key;
@@ -477,7 +490,7 @@ impl Searcher {
             have_eval = true;
             if eval_cache >= beta {
                 pos.make_null();
-                let score = -self.negamax(pos, depth - 1 - 2, -beta, -beta + 1, ply + 1, stop, eval);
+                let score = -self.negamax(pos, depth - 1 - 2, -beta, -beta + 1, ply + 1, stop, eval, pool);
                 pos.unmake_null();
                 if score >= beta {
                     return score;
@@ -519,13 +532,14 @@ let mut searched: Option<Move> = None;
                 || tt_m.from() == king
                 || (pinned & bit(tt_m.from()) != 0);
             let undo = pos.make_move(tt_m);
+            #[cfg(feature = "profiling")]
             PROF.make.fetch_add(1, Ordering::Relaxed);
             if verify && !pos.king_safe(us) {
                 pos.unmake_move(undo);
             } else {
                 self.key_hist[self.key_hist_len] = pos.key;
             self.key_hist_len += 1;
-                let s = -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval);
+                let s = -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval, pool);
                 self.key_hist_len -= 1;
                 pos.unmake_move(undo);
                 if stop.load(Ordering::Relaxed) {
@@ -561,16 +575,20 @@ let mut searched: Option<Move> = None;
             }
         }
 
-        let mut moves = generate_pseudo(pos, false, in_check);
+        let (moves, rest) = pool.split_first_mut().expect("move pool exhausted");
+        generate_pseudo_into(pos, false, in_check, moves);
+        #[cfg(feature = "profiling")]
         PROF.movegen.fetch_add(1, Ordering::Relaxed);
         if moves.len == 0 {
             return if in_check { -MATE + ply as i32 } else { 0 };
         }
 
-        self.order_moves(pos, &mut moves, tt_move, ply);
+        order_moves_impl(pos, &self.killers, &self.history, &mut self.scratch, moves, tt_move, ply);
+        #[cfg(feature = "profiling")]
         PROF.order.fetch_add(1, Ordering::Relaxed);
 
-        for i in 0..moves.len {
+        let num_moves = moves.len;
+        for i in 0..num_moves {
             let m = moves.get(i);
             if searched == Some(m) {
                 continue;
@@ -614,6 +632,7 @@ let mut searched: Option<Move> = None;
                 }
             }
             let undo = pos.make_move(m);
+            #[cfg(feature = "profiling")]
             PROF.make.fetch_add(1, Ordering::Relaxed);
             if verify && !pos.king_safe(us) {
                 pos.unmake_move(undo);
@@ -622,7 +641,7 @@ let mut searched: Option<Move> = None;
             self.key_hist[self.key_hist_len] = pos.key;
             self.key_hist_len += 1;
             let s = if i == 0 && searched.is_none() {
-                -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval)
+                -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval, rest)
             } else {
                 let s = -self.negamax(
                     pos,
@@ -632,9 +651,10 @@ let mut searched: Option<Move> = None;
                     ply + 1,
                     stop,
                     eval,
+                    rest,
                 );
                 if s > alpha0 && s < beta {
-                    -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval)
+                    -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval, rest)
                 } else {
                     s
                 }
@@ -700,8 +720,10 @@ let mut searched: Option<Move> = None;
         ply: usize,
         stop: &AtomicBool,
         eval: EvalFn,
+        pool: &mut [MoveList],
     ) -> i32 {
         self.nodes += 1;
+        #[cfg(feature = "profiling")]
         PROF.qnode.fetch_add(1, Ordering::Relaxed);
         // Same PV-slot reset as negamax: a quiescence leaf is never part of a
         // PV, so a stale length from an earlier position must not leak up.
@@ -721,13 +743,16 @@ let mut searched: Option<Move> = None;
             }
         }
 
-        let mut moves = generate_pseudo(pos, !in_check, in_check);
+        let (moves, rest) = pool.split_first_mut().expect("move pool exhausted");
+        generate_pseudo_into(pos, !in_check, in_check, moves);
+        #[cfg(feature = "profiling")]
         PROF.movegen_q.fetch_add(1, Ordering::Relaxed);
         if moves.len == 0 {
             return if in_check { -MATE + ply as i32 } else { alpha };
         }
 
-        self.order_captures(pos, &mut moves);
+        order_captures_impl(pos, &mut self.scratch, moves);
+        #[cfg(feature = "profiling")]
         PROF.order_cap.fetch_add(1, Ordering::Relaxed);
 
         let mut best = if in_check { -INF } else { alpha };
@@ -736,7 +761,8 @@ let mut searched: Option<Move> = None;
         let pinned = pos.pinned();
         let king = pos.king_sq[us];
 
-        for i in 0..moves.len {
+        let num_moves = moves.len;
+        for i in 0..num_moves {
             let m = moves.get(i);
             let verify = in_check
                 || m.is_en_passant()
@@ -751,18 +777,20 @@ let mut searched: Option<Move> = None;
                 if stand + SEE_VAL[victim] + 200 < alpha0 {
                     continue;
                 }
+                #[cfg(feature = "profiling")]
                 PROF.see.fetch_add(1, Ordering::Relaxed);
                 if see(pos, m.from(), m.to()) < 0 {
                     continue;
                 }
             }
             let undo = pos.make_move(m);
+            #[cfg(feature = "profiling")]
             PROF.make_q.fetch_add(1, Ordering::Relaxed);
             if verify && !pos.king_safe(us) {
                 pos.unmake_move(undo);
                 continue;
             }
-            let s = -self.quiescence(pos, -beta, -alpha0, ply + 1, stop, eval);
+            let s = -self.quiescence(pos, -beta, -alpha0, ply + 1, stop, eval, rest);
             pos.unmake_move(undo);
             if stop.load(Ordering::Relaxed) {
                 return 0;
@@ -784,82 +812,7 @@ let mut searched: Option<Move> = None;
     }
 
     pub fn order_moves(&mut self, pos: &Position, moves: &mut MoveList, tt_move: Option<Move>, ply: usize) {
-        let scores = &mut self.scratch[..moves.len];
-        for i in 0..moves.len {
-            let m = moves.get(i);
-            let mut s = 0;
-            if tt_move == Some(m) {
-                s = 1_000_000;
-            } else {
-                if m.is_promotion() {
-                    s += 800_000 + PIECE_ORDER[m.promo_pt()];
-                }
-                if m.is_capture() {
-                    let victim = if m.is_en_passant() {
-                        PAWN
-                    } else {
-                        pos.piece_pt_at(m.to())
-                    };
-                    let attacker = if m.is_promotion() {
-                        PAWN
-                    } else {
-                        pos.piece_pt_at(m.from())
-                    };
-                    s += 500_000 + PIECE_ORDER[victim] * 16 - PIECE_ORDER[attacker];
-                }
-                if self.killers[ply][0] == m {
-                    s += 300_000;
-                } else if self.killers[ply][1] == m {
-                    s += 290_000;
-                }
-                s += self.history[pos.side][m.from()][m.to()];
-            }
-            scores[i] = s;
-        }
-        for i in 1..moves.len {
-            let key = scores[i];
-            let mv = moves.get(i);
-            let mut j = i;
-            while j > 0 && scores[j - 1] < key {
-                moves.moves[j] = moves.moves[j - 1];
-                scores[j] = scores[j - 1];
-                j -= 1;
-            }
-            moves.moves[j] = mv;
-            scores[j] = key;
-        }
-    }
-
-    fn order_captures(&mut self, pos: &Position, moves: &mut MoveList) {
-        let scores = &mut self.scratch[..moves.len];
-        for i in 0..moves.len {
-            let m = moves.get(i);
-            scores[i] = if m.is_promotion() {
-                700_000 + PIECE_ORDER[m.promo_pt()]
-            } else if m.is_capture() {
-                let victim = if m.is_en_passant() {
-                    PAWN
-                } else {
-                    pos.piece_pt_at(m.to())
-                };
-                let attacker = pos.piece_pt_at(m.from());
-                PIECE_ORDER[victim] * 16 - PIECE_ORDER[attacker]
-            } else {
-                0
-            };
-        }
-        for i in 1..moves.len {
-            let key = scores[i];
-            let mv = moves.get(i);
-            let mut j = i;
-            while j > 0 && scores[j - 1] < key {
-                moves.moves[j] = moves.moves[j - 1];
-                scores[j] = scores[j - 1];
-                j -= 1;
-            }
-            moves.moves[j] = mv;
-            scores[j] = key;
-        }
+        order_moves_impl(pos, &self.killers, &self.history, &mut self.scratch, moves, tt_move, ply);
     }
 
     fn update_history(&mut self, pos: &Position, m: Move, depth: i32) {
@@ -880,6 +833,11 @@ let mut searched: Option<Move> = None;
     /// cannot recur across an irreversible move, so earlier entries cannot
     /// match.
     fn is_repetition(&self, key: u64, halfmove: u32) -> bool {
+        // A position can only recur after at least 4 plies (two full moves).
+        // Skipping the scan for small halfmove windows avoids most iterations.
+        if halfmove < 4 {
+            return false;
+        }
         let len = self.key_hist_len;
         let start = len.saturating_sub(halfmove as usize + 1);
         let mut count = 0;
@@ -921,6 +879,97 @@ fn compute_budget(pos: &Position, limits: &Limits) -> Duration {
         return Duration::from_millis(budget);
     }
     Duration::from_secs(3600)
+}
+
+/// Scores and insertion-sorts `moves` by descending priority: TT move first,
+/// then MVV-LVA captures/promotions, killers, history. `scratch` holds the
+/// per-call scores and is passed in so the caller can hold `moves` and
+/// `scratch` as disjoint borrows of the same `Searcher`.
+fn order_moves_impl(
+    pos: &Position,
+    killers: &[[Move; 2]; MAX_PLY],
+    history: &[[[i32; 64]; 64]; 2],
+    scratch: &mut [i32],
+    moves: &mut MoveList,
+    tt_move: Option<Move>,
+    ply: usize,
+) {
+    for i in 0..moves.len {
+        let m = moves.get(i);
+        let mut s = 0;
+        if tt_move == Some(m) {
+            s = 1_000_000;
+        } else {
+            if m.is_promotion() {
+                s += 800_000 + PIECE_ORDER[m.promo_pt()];
+            }
+            if m.is_capture() {
+                let victim = if m.is_en_passant() {
+                    PAWN
+                } else {
+                    pos.piece_pt_at(m.to())
+                };
+                let attacker = if m.is_promotion() {
+                    PAWN
+                } else {
+                    pos.piece_pt_at(m.from())
+                };
+                s += 500_000 + PIECE_ORDER[victim] * 16 - PIECE_ORDER[attacker];
+            }
+            if killers[ply][0] == m {
+                s += 300_000;
+            } else if killers[ply][1] == m {
+                s += 290_000;
+            }
+            s += history[pos.side][m.from()][m.to()];
+        }
+        scratch[i] = s;
+    }
+    for i in 1..moves.len {
+        let key = scratch[i];
+        let mv = moves.get(i);
+        let mut j = i;
+        while j > 0 && scratch[j - 1] < key {
+            moves.moves[j] = moves.moves[j - 1];
+            scratch[j] = scratch[j - 1];
+            j -= 1;
+        }
+        moves.moves[j] = mv;
+        scratch[j] = key;
+    }
+}
+
+/// Scores and insertion-sorts the quiescence move list (MVV-LVA, promotions
+/// first) using `scratch` as the per-call score buffer.
+fn order_captures_impl(pos: &Position, scratch: &mut [i32], moves: &mut MoveList) {
+    for i in 0..moves.len {
+        let m = moves.get(i);
+        scratch[i] = if m.is_promotion() {
+            700_000 + PIECE_ORDER[m.promo_pt()]
+        } else if m.is_capture() {
+            let victim = if m.is_en_passant() {
+                PAWN
+            } else {
+                pos.piece_pt_at(m.to())
+            };
+            let attacker = pos.piece_pt_at(m.from());
+            PIECE_ORDER[victim] * 16 - PIECE_ORDER[attacker]
+        } else {
+            0
+        };
+    }
+    for i in 1..moves.len {
+        let key = scratch[i];
+        let mv = moves.get(i);
+        let mut j = i;
+        while j > 0 && scratch[j - 1] < key {
+            moves.moves[j] = moves.moves[j - 1];
+            scratch[j] = scratch[j - 1];
+            j -= 1;
+        }
+        moves.moves[j] = mv;
+        scratch[j] = key;
+    }
 }
 
 #[cfg(test)]
@@ -970,3 +1019,8 @@ mod tests {
         assert_eq!(see_fen("4r2k/8/8/8/8/8/8/3Q3K w - - 0 1", "d1", "e8"), 500);
     }
 }
+
+
+
+
+

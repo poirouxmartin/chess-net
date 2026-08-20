@@ -216,6 +216,7 @@ fn bench_search() {
     bench(12);
 }
 
+#[cfg(feature = "profiling")]
 #[test]
 fn prof_search() {
     engine::init();

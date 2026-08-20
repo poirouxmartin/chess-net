@@ -7,6 +7,7 @@ use crate::position::*;
 
 pub const MAX_MOVES: usize = 256;
 
+#[derive(Clone, Copy)]
 pub struct MoveList {
     pub moves: [Move; MAX_MOVES],
     pub len: usize,
@@ -468,6 +469,16 @@ pub fn generate_captures(pos: &Position) -> MoveList {
 /// so the caller passes `captures_only = !in_check`. Castling is generated
 /// only when not in check and its path squares are already validated.
 pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> MoveList {
+    let mut out = MoveList::new();
+    generate_pseudo_into(pos, captures_only, in_check, &mut out);
+    out
+}
+
+/// Fills `out` (cleared first) with the pseudo-legal moves. See
+/// `generate_pseudo`. The caller supplies the buffer so the hot search path
+/// reuses a per-ply `MoveList` instead of zeroing a fresh 1 KB array per node.
+pub fn generate_pseudo_into(pos: &Position, captures_only: bool, in_check: bool, out: &mut MoveList) {
+    out.len = 0;
     let us = pos.side;
     let them = us ^ 1;
     let k = pos.king_sq[us];
@@ -475,7 +486,6 @@ pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> M
     let enemies = pos.pieces_of(them);
     let empty = !occ;
     let targets = empty | enemies;
-    let mut list = MoveList::new();
 
     // ---- King moves ----
     let mut kb = king_attacks(k) & targets;
@@ -484,13 +494,13 @@ pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> M
         let is_cap = enemies & bit(sq) != 0;
         if !captures_only || is_cap {
             let flags = if is_cap { FLAG_CAPTURE } else { FLAG_QUIET };
-            list.push(Move::new(k, sq, 0, flags).with_piece(KING));
+            out.push(Move::new(k, sq, 0, flags).with_piece(KING));
         }
     }
 
     // ---- Castling (quiet; square safety already checked by gen_castling) ----
     if !captures_only && !in_check {
-        gen_castling(pos, &mut list, occ, occ & !bit(k), them);
+        gen_castling(pos, out, occ, occ & !bit(k), them);
     }
 
     // ---- Pawns ----
@@ -506,14 +516,14 @@ pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> M
                 if empty & bit(ps) != 0 {
                     if rank_of(ps) == promo_rank {
                         for p in [PROMO_QUEEN, PROMO_ROOK, PROMO_BISHOP, PROMO_KNIGHT] {
-                            list.push(Move::new(sq, ps, p, FLAG_PROMO).with_piece(PAWN));
+                            out.push(Move::new(sq, ps, p, FLAG_PROMO).with_piece(PAWN));
                         }
                     } else {
-                        list.push(Move::new(sq, ps, 0, FLAG_QUIET).with_piece(PAWN));
+                        out.push(Move::new(sq, ps, 0, FLAG_QUIET).with_piece(PAWN));
                         if rank_of(sq) == start_rank {
                             if let Some(ps2) = step_sq(ps, forward) {
                                 if empty & bit(ps2) != 0 {
-                                    list.push(Move::new(sq, ps2, 0, FLAG_DOUBLE).with_piece(PAWN));
+                                    out.push(Move::new(sq, ps2, 0, FLAG_DOUBLE).with_piece(PAWN));
                                 }
                             }
                         }
@@ -525,7 +535,7 @@ pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> M
             // quiescence search even in captures-only mode.
             if empty & bit(ps) != 0 && rank_of(ps) == promo_rank {
                 for p in [PROMO_QUEEN, PROMO_ROOK, PROMO_BISHOP, PROMO_KNIGHT] {
-                    list.push(Move::new(sq, ps, p, FLAG_PROMO).with_piece(PAWN));
+                    out.push(Move::new(sq, ps, p, FLAG_PROMO).with_piece(PAWN));
                 }
             }
         }
@@ -535,10 +545,10 @@ pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> M
             let t = pop_lsb(&mut cb);
             if rank_of(t) == promo_rank {
                 for p in [PROMO_QUEEN, PROMO_ROOK, PROMO_BISHOP, PROMO_KNIGHT] {
-                    list.push(Move::new(sq, t, p, FLAG_PROMO_CAPTURE).with_piece(PAWN));
+                    out.push(Move::new(sq, t, p, FLAG_PROMO_CAPTURE).with_piece(PAWN));
                 }
             } else {
-                list.push(Move::new(sq, t, 0, FLAG_CAPTURE).with_piece(PAWN));
+                out.push(Move::new(sq, t, 0, FLAG_CAPTURE).with_piece(PAWN));
             }
         }
 
@@ -546,7 +556,7 @@ pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> M
         // are gone) is verified lazily by the caller.
         if let Some(ep) = pos.ep {
             if pawn_attacks(us, sq) & bit(ep) != 0 {
-                list.push(Move::new(sq, ep, 0, FLAG_EN_PASSANT).with_piece(PAWN));
+                out.push(Move::new(sq, ep, 0, FLAG_EN_PASSANT).with_piece(PAWN));
             }
         }
     }
@@ -559,7 +569,7 @@ pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> M
         while tb != 0 {
             let t = pop_lsb(&mut tb);
             if !captures_only || enemies & bit(t) != 0 {
-                push_simple(&mut list, sq, t, enemies, KNIGHT);
+                push_simple(out, sq, t, enemies, KNIGHT);
             }
         }
     }
@@ -573,11 +583,10 @@ pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> M
             while tb != 0 {
                 let t = pop_lsb(&mut tb);
                 if !captures_only || enemies & bit(t) != 0 {
-                    push_simple(&mut list, sq, t, enemies, pt);
+                    push_simple(out, sq, t, enemies, pt);
                 }
             }
         }
     }
-
-    list
 }
+

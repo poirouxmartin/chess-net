@@ -4,3 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+
+[features]
+default = []
+# Per-search composition counters (search.rs PROF). Off by default; the
+# atomic increments cost measurable NPS in the hot loop.
+profiling = []

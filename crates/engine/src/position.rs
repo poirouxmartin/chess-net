@@ -384,7 +384,14 @@ impl Position {
         let moving_pt = if flags == FLAG_PROMO || flags == FLAG_PROMO_CAPTURE {
             m.promo_pt()
         } else {
-            self.piece_pt_at(from)
+            // Movegen (and the TT, which stores movegen moves) packs the moving
+            // piece in bits 18-20; only `Move::null()` entries have it unset.
+            let p = m.piece_pt();
+            if p != 0 {
+                p
+            } else {
+                self.piece_pt_at(from)
+            }
         };
         let base_pt = if flags == FLAG_PROMO || flags == FLAG_PROMO_CAPTURE {
             PAWN
@@ -447,7 +454,13 @@ impl Position {
         let moving_pt = if flags == FLAG_PROMO || flags == FLAG_PROMO_CAPTURE {
             m.promo_pt()
         } else {
-            self.piece_pt_at(to)
+            // Same piece-bits optimization as make_move.
+            let p = m.piece_pt();
+            if p != 0 {
+                p
+            } else {
+                self.piece_pt_at(to)
+            }
         };
 
         self.remove_piece(mover, to, moving_pt);
