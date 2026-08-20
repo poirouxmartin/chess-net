@@ -10,7 +10,7 @@ use eframe::egui::{
 use engine::evaluate::{evaluate, evaluate_breakdown, MATE};
 use engine::mcts::{cp_from_prob, mcts_parallel, wdl_from_q, MctsLimits};
 use engine::move_::Move;
-use engine::movegen::generate_legal;
+use engine::movegen::{generate_legal, MoveList};
 use engine::position::{BLACK, Position, WHITE};
 use engine::san::to_san;
 use engine::search::{Limits, MultiLine, SearchIter, Searcher};
@@ -18,6 +18,20 @@ use engine::search::{Limits, MultiLine, SearchIter, Searcher};
 const BOARD_PX: f32 = 640.0;
 const BOARD_BG: Color32 = Color32::from_rgb(45, 45, 48);
 const PIECE_NAMES: [&str; 6] = ["P", "N", "B", "R", "Q", "K"];
+
+/// MCTS eval: PeSTO value, no policy (uniform priors).
+fn pesto_combined(pos: &Position, _legal: &MoveList) -> (i32, Vec<f32>) {
+    (evaluate(pos), Vec::new())
+}
+
+/// MCTS eval: loaded net (value + policy in one forward), or PeSTO fallback.
+fn nn_combined(pos: &Position, legal: &MoveList) -> (i32, Vec<f32>) {
+    if nn::is_loaded() {
+        nn::evaluate_loaded_combined(pos, legal)
+    } else {
+        (evaluate(pos), Vec::new())
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum EvalKind {
@@ -98,6 +112,7 @@ struct ChessApp {
     tx: mpsc::Sender<(u64, Move, Vec<MultiLine>)>,
     rx: mpsc::Receiver<(u64, Move, Vec<MultiLine>)>,
     eval_fn: engine::search::EvalFn,
+    eval_policy_fn: engine::mcts::ValuePolicyFn,
 }
 
 impl ChessApp {
@@ -133,6 +148,7 @@ impl ChessApp {
             tx,
             rx,
             eval_fn: evaluate,
+            eval_policy_fn: pesto_combined,
         }
     }
 
@@ -229,6 +245,7 @@ impl ChessApp {
         let live = self.live.clone();
         let tx = self.tx.clone();
         let eval = self.eval_fn;
+        let eval_policy = self.eval_policy_fn;
         let ms = self.movetime_ms;
         let mcts_threads = self.mcts_threads;
         let mcts_analysis_ms = self.mcts_analysis_ms;
@@ -268,7 +285,7 @@ impl ChessApp {
                     } else {
                         MctsLimits { playouts: None, movetime: Some(ms), threads: mcts_threads }
                     };
-                    let result = mcts_parallel(&mut pos, &limits, stop.clone(), eval, Some(&mut |p| {
+                    let result = mcts_parallel(&mut pos, &limits, stop.clone(), eval_policy, Some(&mut |p| {
                         let mut l = live.lock().unwrap();
                         *l = LiveInfo {
                             mcts: true,
@@ -728,8 +745,10 @@ impl ChessApp {
         }
         if self.eval_kind == EvalKind::NN {
             self.eval_fn = nn::evaluate_loaded_stm;
+            self.eval_policy_fn = nn_combined;
         } else {
             self.eval_fn = evaluate;
+            self.eval_policy_fn = pesto_combined;
         }
         self.static_eval_panel(ui);
 

@@ -2,9 +2,13 @@
 
 The network matches the CSNN format read by the Rust engine:
   acc  = fb + sum over active features of fw[feature]     (sparse L0)
-  h1   = relu(b1 + w1 @ acc)
+  h1   = relu(b1 + w1 @ relu(acc))
   logit = bo + wo @ relu(h1)
   score_cp = logit * 400   (applied by the engine at inference)
+
+An optional policy head shares h1 and outputs one logit per possible
+from*64+to move (4096) so MCTS can use learned move priors:
+  policy_logits = bp + wp @ relu(h1)
 """
 
 import chess
@@ -21,26 +25,47 @@ KP768_FEAT_COUNT = F.KP768_FEAT_COUNT
 
 _MAX_ACTIVE = 96
 
+# Policy output space: one logit per (from, to) square pair.
+POLICY_SIZE = 4096
+
+
+def move_policy_index(mv):
+    """Policy index of a python-chess move: from*64 + to (promotion variants
+    of the same from->to share the index)."""
+    return mv.from_square * 64 + mv.to_square
+
 
 class NNUE(nn.Module):
-    """3-layer sparse MLP. forward() takes active feature indices."""
+    """3-layer sparse MLP with an optional policy head. forward() takes active
+    feature indices."""
 
-    def __init__(self, feat_count, l0, l1):
+    def __init__(self, feat_count, l0, l1, policy_size=POLICY_SIZE):
         super().__init__()
         self.feat_count = feat_count
         self.fw = nn.Parameter(torch.randn(feat_count, l0) * 0.05)
         self.fb = nn.Parameter(torch.zeros(l0))
         self.w1 = nn.Linear(l0, l1)
         self.wo = nn.Linear(l1, 1)
+        self.policy_size = policy_size
+        self.wp = nn.Parameter(torch.randn(policy_size, l1) * 0.02)
+        self.bp = nn.Parameter(torch.zeros(policy_size))
 
     def forward(self, indices, mask):
         # indices: (B, max_active) int64, mask: (B, max_active) bool
+        return self._forward(indices, mask)[0]
+
+    def forward_with_policy(self, indices, mask):
+        # indices: (B, max_active) int64, mask: (B, max_active) bool
+        return self._forward(indices, mask)
+
+    def _forward(self, indices, mask):
         B, K = indices.shape
         fw = self.fw.index_select(0, indices.reshape(-1)).reshape(B, K, -1)
         acc = self.fb.unsqueeze(0) + (fw * mask.unsqueeze(-1)).sum(dim=1)
         h = torch.relu(self.w1(torch.relu(acc)))
         logit = self.wo(torch.relu(h)).squeeze(-1)
-        return logit
+        policy = self.bp.unsqueeze(0) + torch.relu(h) @ self.wp.t()
+        return logit, policy
 
     @torch.no_grad()
     def evaluate(self, board, stm=True):
@@ -107,4 +132,8 @@ def save_csnn(model, path, feat=FEAT_KP768):
         w["w1.bias"].detach().cpu().numpy().tolist(),
         w["wo.weight"].detach().cpu().numpy().reshape(-1).tolist(),
         w["wo.bias"].item(),
+        policy=(
+            w["wp"].detach().cpu().numpy().reshape(-1).tolist(),
+            w["bp"].detach().cpu().numpy().tolist(),
+        ),
     )

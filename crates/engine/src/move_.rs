@@ -17,7 +17,7 @@ pub const PROMO_ROOK: u8 = 1;
 pub const PROMO_BISHOP: u8 = 2;
 pub const PROMO_KNIGHT: u8 = 3;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
 pub struct Move(pub u32);
 
 impl Move {

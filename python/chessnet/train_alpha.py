@@ -23,6 +23,8 @@ def main():
     ap.add_argument("--mcts-workers", type=int, default=1, help="parallel self-play subprocesses")
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=1024)
+    ap.add_argument("--lambda-policy", type=float, default=1.0,
+                    help="weight of the policy cross-entropy term (0 = value only)")
     ap.add_argument("--feat", type=int, default=2, choices=[1, 2])
     ap.add_argument("--l0", type=int, default=256)
     ap.add_argument("--l1", type=int, default=32)
@@ -38,7 +40,8 @@ def main():
     for cycle in range(args.cycles):
         print(f"cycle {cycle + 1}/{args.cycles}: self-play {args.games} games...")
         data = trainer.self_play(args.games, args.mcts_iters, mcts_workers=args.mcts_workers)
-        trainer.train(data, epochs=args.epochs, batch_size=args.batch_size)
+        trainer.train(data, epochs=args.epochs, batch_size=args.batch_size,
+                      lambda_policy=args.lambda_policy)
         trainer.net = trainer.net.cpu()
         torch.save(trainer.net.state_dict(), args.out)
         save_csnn(trainer.net, args.csnn, feat=args.feat)

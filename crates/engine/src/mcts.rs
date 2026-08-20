@@ -2,8 +2,9 @@
 //!
 //! The value function maps a position to centipawns for the side to move
 //! (PeSTO or the NN); the leaf value is `2*sigmoid(cp/400) - 1`, a zero-sum
-//! score in [-1, 1]. There is no policy head yet, so the prior is uniform over
-//! legal moves, matching the Python self-play trainer.
+//! score in [-1, 1]. A policy function can provide per-move priors from the NN
+//! policy head (softmax-masked over legal moves); when it returns no logits the
+//! prior is uniform over legal moves.
 //!
 //! Nodes live in a preallocated arena (u32 indices) of atomics so the tree can
 //! be shared across threads: selection applies a virtual loss on the chosen
@@ -16,13 +17,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::move_::Move;
-use crate::movegen::generate_legal;
+use crate::movegen::{generate_legal, MoveList, MAX_MOVES};
 use crate::position::Position;
 use crate::search::EvalFn;
 
 /// Value function: centipawns from the side-to-move perspective (same contract
 /// as the alpha-beta `EvalFn`).
 pub type ValueFn = EvalFn;
+
+/// Combined value + move policy: centipawns for the side to move and raw
+/// policy logits, one per move in `legal` (same order; empty when no policy is
+/// available -> uniform priors). The eval function computes both in a single
+/// forward. Passing an empty `legal` requests the value only.
+pub type ValuePolicyFn = fn(&Position, &MoveList) -> (i32, Vec<f32>);
 
 #[derive(Default)]
 pub struct MctsLimits {
@@ -268,62 +275,98 @@ impl Tree {
     }
 }
 
+/// Writes softmax priors for `logits` (one per legal move, `legal_len` of them)
+/// into `priors`. When `logits` is empty (no policy head), uses uniform priors.
+fn softmax_priors(logits: &[f32], legal_len: usize, priors: &mut [f32]) {
+    if logits.len() != legal_len {
+        priors[..legal_len].fill(1.0 / legal_len as f32);
+        return;
+    }
+    let mut max = f32::NEG_INFINITY;
+    for &l in &logits[..legal_len] {
+        max = max.max(l);
+    }
+    let mut sum = 0.0;
+    for (i, &l) in logits[..legal_len].iter().enumerate() {
+        let e = (l - max).exp();
+        priors[i] = e;
+        sum += e;
+    }
+    let inv = 1.0 / sum.max(f32::EPSILON);
+    for p in &mut priors[..legal_len] {
+        *p *= inv;
+    }
+}
+
+/// Value-only eval (leaf paths that don't expand): value for the side to move.
+#[inline]
+fn eval_value(eval_fn: ValuePolicyFn, pos: &Position) -> f32 {
+    let empty = MoveList::new();
+    score_from_cp(eval_fn(pos, &empty).0)
+}
+
 /// Creates the root's children (single-threaded, before any worker starts).
-fn expand_root(tree: &Tree, pos: &Position) {
+/// `root` is the node whose children are created (ROOT_ID for a fresh tree, or
+/// a reused subtree root).
+fn expand_root(tree: &Tree, root: u32, pos: &Position, eval_fn: ValuePolicyFn) {
     let legal = generate_legal(pos);
-    let prior = 1.0 / legal.len as f32;
+    let (_, logits) = eval_fn(pos, &legal);
+    let mut priors = [0f32; MAX_MOVES];
+    softmax_priors(&logits, legal.len, &mut priors);
     let mut first = NO_ID;
     let mut count = 0u32;
-    for i in 0..legal.len {
+    for (i, &mv) in legal.moves[..legal.len].iter().enumerate() {
         let id = tree.alloc();
         if id == NO_ID {
             break;
         }
         let c = tree.node(id);
-        c.mv.store(legal.moves[i].0, Ordering::Relaxed);
-        c.parent.store(ROOT_ID, Ordering::Relaxed);
-        c.prior.store(prior.to_bits(), Ordering::Relaxed);
+        c.mv.store(mv.0, Ordering::Relaxed);
+        c.parent.store(root, Ordering::Relaxed);
+        c.prior.store(priors[i].to_bits(), Ordering::Relaxed);
         c.next_sibling.store(first, Ordering::Relaxed);
         first = id;
         count += 1;
     }
-    tree.node(ROOT_ID).first_child.store(first, Ordering::Release);
-    tree.node(ROOT_ID).n_children.store(count, Ordering::Release);
+    tree.node(root).first_child.store(first, Ordering::Release);
+    tree.node(root).n_children.store(count, Ordering::Release);
 }
 
 /// Expands `idx` under its spinlock (once) and returns the leaf value for the
 /// side to move. Concurrent workers spin briefly, then evaluate as a leaf.
-fn expand(tree: &Tree, idx: u32, pos: &mut Position, value_fn: ValueFn) -> f32 {
+fn expand(tree: &Tree, idx: u32, pos: &mut Position, eval_fn: ValuePolicyFn) -> f32 {
     let lock = &tree.node(idx).lock;
     // If another thread is already expanding this leaf, don't wait: evaluate it
     // as a leaf instead (the tree is still correct, just shallower there).
     if lock.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        return score_from_cp(value_fn(pos));
+        return eval_value(eval_fn, pos);
     }
 
     let node = tree.node(idx);
     let v = if node.n_children.load(Ordering::Acquire) > 0 || node.terminal.load(Ordering::Acquire) {
         // Another thread already expanded this node (or it turned terminal).
-        score_from_cp(value_fn(pos))
+        eval_value(eval_fn, pos)
     } else {
         let legal = generate_legal(pos);
         if legal.len == 0 {
             node.terminal.store(true, Ordering::Release);
             if pos.in_check() { -1.0 } else { 0.0 }
-        } else {
-            let v = score_from_cp(value_fn(pos));
-            let prior = 1.0 / legal.len as f32;
+} else {
+            let (v_cp, logits) = eval_fn(pos, &legal);
+            let v = score_from_cp(v_cp);
+            let mut priors = [0f32; MAX_MOVES];
+            softmax_priors(&logits, legal.len, &mut priors);
             let mut first = NO_ID;
             let mut count = 0u32;
-            for i in 0..legal.len {
+            for (i, &mv) in legal.moves[..legal.len].iter().enumerate() {
                 let id = tree.alloc();
                 if id == NO_ID {
                     break;
                 }
                 let c = tree.node(id);
-                c.mv.store(legal.moves[i].0, Ordering::Relaxed);
+                c.mv.store(mv.0, Ordering::Relaxed);
                 c.parent.store(idx, Ordering::Relaxed);
-                c.prior.store(prior.to_bits(), Ordering::Relaxed);
+                c.prior.store(priors[i].to_bits(), Ordering::Relaxed);
                 c.next_sibling.store(first, Ordering::Relaxed);
                 first = id;
                 count += 1;
@@ -338,13 +381,15 @@ fn expand(tree: &Tree, idx: u32, pos: &mut Position, value_fn: ValueFn) -> f32 {
 }
 
 /// One selection -> expansion/evaluation -> backup cycle. `pos` is a scratch
-/// copy that is mutated as the tree is descended.
-fn playout(tree: &Tree, pos: &mut Position, value_fn: ValueFn) {
-    let mut idx = ROOT_ID;
+/// copy that is mutated as the tree is descended. `root` is the search root
+/// (ROOT_ID for a fresh tree); when reusing a kept subtree it is that node and
+/// the backup stops there.
+fn playout_from(tree: &Tree, root: u32, pos: &mut Position, eval_fn: ValuePolicyFn) {
+    let mut idx = root;
     let mut ply = 0u32;
 
     // The root's visit for this playout.
-    tree.add_visit(ROOT_ID);
+    tree.add_visit(root);
 
     // Selection: descend while the current node is expanded and not at the
     // depth cap.
@@ -390,22 +435,27 @@ fn playout(tree: &Tree, pos: &mut Position, value_fn: ValueFn) {
         0.0
     } else if node.n_children.load(Ordering::Acquire) > 0 {
         // Internal node reached through the depth cap: evaluate as a leaf.
-        score_from_cp(value_fn(pos))
+        eval_value(eval_fn, pos)
     } else {
-        expand(tree, idx, pos, value_fn)
+        expand(tree, idx, pos, eval_fn)
     };
 
-    // Backup: only values are adjusted here (visits were placed during
+// Backup: only values are adjusted here (visits were placed during
     // selection). Each node accumulates the outcome for the side that moved
-    // into it (its parent's perspective).
+    // into it (its parent's perspective). Stops at the search root.
     let mut n = idx;
     let mut v_scaled = (-v_leaf * SCALE as f32).round() as i32;
-    while n != NO_ID {
+    while n != root {
         let node = tree.node(n);
         tree.add_scaled(n, v_scaled);
         v_scaled = v_scaled.wrapping_neg();
         n = node.parent.load(Ordering::Relaxed);
     }
+}
+
+#[inline]
+fn playout(tree: &Tree, pos: &mut Position, eval_fn: ValuePolicyFn) {
+    playout_from(tree, ROOT_ID, pos, eval_fn);
 }
 
 fn arena_cap(limits: &MctsLimits) -> usize {
@@ -420,7 +470,7 @@ pub fn mcts_root(
     pos: &mut Position,
     limits: &MctsLimits,
     stop: &AtomicBool,
-    value_fn: ValueFn,
+    eval_fn: ValuePolicyFn,
     mut on_progress: Option<&mut dyn FnMut(&MctsProgress)>,
 ) -> MctsResult {
     let start = Instant::now();
@@ -439,7 +489,7 @@ return MctsResult {
             time_ms: start.elapsed().as_millis() as u64,
         };
     }
-    expand_root(&tree, pos);
+    expand_root(&tree, ROOT_ID, pos, eval_fn);
 
     let mut playouts = 0u64;
     let mut last_report = start;
@@ -460,7 +510,7 @@ return MctsResult {
         }
 
         let mut p = root_pos;
-        playout(&tree, &mut p, value_fn);
+        playout(&tree, &mut p, eval_fn);
         playouts += 1;
 
         if on_progress.is_some() && last_report.elapsed().as_millis() >= 16 {
@@ -504,7 +554,7 @@ pub fn mcts_parallel(
     pos: &mut Position,
     limits: &MctsLimits,
     stop: Arc<AtomicBool>,
-    value_fn: ValueFn,
+    eval_fn: ValuePolicyFn,
     mut on_progress: Option<&mut dyn FnMut(&MctsProgress)>,
 ) -> MctsResult {
     let start = Instant::now();
@@ -536,11 +586,11 @@ return MctsResult {
     let budget_playouts = limits.playouts;
     let budget_movetime = limits.movetime;
 
-    let mut trees: Vec<Arc<Tree>> = Vec::with_capacity(threads);
+let mut trees: Vec<Arc<Tree>> = Vec::with_capacity(threads);
     let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
         let tree = Arc::new(Tree::new(per_thread_cap(limits, threads)));
-        expand_root(&tree, &root_pos);
+        expand_root(&tree, ROOT_ID, &root_pos, eval_fn);
         trees.push(tree.clone());
         let stop = stop.clone();
 let counter = counter.clone();
@@ -562,7 +612,7 @@ let counter = counter.clone();
                     }
                 }
                 let mut p = root_pos;
-                playout(&tree, &mut p, value_fn);
+                playout(&tree, &mut p, eval_fn);
                 counter.fetch_add(1, Ordering::Relaxed);
             }
             active.fetch_sub(1, Ordering::Relaxed);
@@ -640,8 +690,186 @@ fn merge_trees(trees: &[Arc<Tree>]) -> (Move, f32, Vec<(Move, u32)>) {
     let mut sorted: Vec<(Move, u32)> = visits.into_iter().collect();
     sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
     let best = sorted[0].0;
-    let total = sorted[0].1.max(1) as f64;
+let total = sorted[0].1.max(1) as f64;
     let q = (q_sum.get(&best).copied().unwrap_or(0.0) / total).clamp(-1.0, 1.0) as f32;
     (best, q_to_prob(q), sorted)
+}
+
+/// Incremental parallel MCTS with a reusable tree (AlphaZero-style): after a
+/// search, `keep_child` re-points the root at the chosen child so the next
+/// search builds on the existing subtree. The tree is shared across worker
+/// threads (all state is atomic); a full arena triggers a rebuild. This is the
+/// workhorse for self-play generation.
+pub struct MctsSearch {
+    tree: Arc<Tree>,
+    root: u32,
+    threads: usize,
+    cap: usize,
+    rebuilds: u64,
+}
+
+impl MctsSearch {
+    pub fn new(cap: usize, threads: usize) -> Self {
+        let cap = cap.max(1024);
+        MctsSearch {
+            tree: Arc::new(Tree::new(cap)),
+            root: ROOT_ID,
+            threads: threads.max(1),
+            cap,
+            rebuilds: 0,
+        }
+    }
+
+    /// Number of times the arena was full and the tree had to be rebuilt.
+    pub fn rebuilds(&self) -> u64 {
+        self.rebuilds
+    }
+
+    /// Starts a fresh tree (new game).
+    pub fn reset(&mut self) {
+        self.tree = Arc::new(Tree::new(self.cap));
+        self.root = ROOT_ID;
+    }
+
+    /// Runs up to `playouts` playouts (or until `stop`) from the current root,
+    /// which must correspond to `pos`. Terminal positions return immediately.
+    pub fn search(
+        &mut self,
+        pos: &Position,
+        playouts: u64,
+        eval_fn: ValuePolicyFn,
+        stop: Arc<AtomicBool>,
+    ) -> MctsResult {
+        let start = Instant::now();
+        let legal = generate_legal(pos);
+        if legal.len == 0 {
+            let value = if pos.in_check() { 0.0 } else { 0.5 };
+            return MctsResult {
+                best: Move::null(),
+                playouts: 0,
+                visits: Vec::new(),
+                value,
+                mates: 0,
+                draws: 0,
+                time_ms: 0,
+            };
+        }
+
+        // Rebuild when the arena is nearly full (rare with a generous cap).
+        if self.tree.len.load(Ordering::Relaxed) as usize + 4096 > self.cap {
+            self.tree = Arc::new(Tree::new(self.cap));
+            self.root = ROOT_ID;
+            self.rebuilds += 1;
+        }
+
+        // Make sure the root's children exist for this position.
+        if self.tree.node(self.root).n_children.load(Ordering::Acquire) == 0 {
+            expand_root(&self.tree, self.root, pos, eval_fn);
+        }
+
+        let tree = self.tree.clone();
+        let root = self.root;
+        let root_pos = *pos;
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::with_capacity(self.threads);
+        for _ in 0..self.threads {
+            let tree = tree.clone();
+            let counter = counter.clone();
+            let stop = stop.clone();
+            handles.push(std::thread::spawn(move || loop {
+                if stop.load(Ordering::Relaxed) || counter.load(Ordering::Relaxed) >= playouts {
+                    break;
+                }
+                let mut p = root_pos;
+                playout_from(&tree, root, &mut p, eval_fn);
+                counter.fetch_add(1, Ordering::Relaxed);
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+
+        let best_id = tree.best_child(root);
+        let best = tree.node(best_id).mv();
+        let value = q_to_prob(tree.node(best_id).q());
+        MctsResult {
+            best,
+            playouts: counter.load(Ordering::Relaxed),
+            visits: tree.visits_of(root),
+            value,
+            mates: tree.mates.load(Ordering::Relaxed),
+            draws: tree.draws.load(Ordering::Relaxed),
+            time_ms: start.elapsed().as_millis() as u64,
+        }
+    }
+
+    /// Re-points the search root at the child matching `mv` (the played move),
+    /// keeping its subtree for the next search. The caller must then make the
+    /// move so `pos` matches the new root. Falls back to a fresh tree when the
+    /// move is not found (should not happen).
+    pub fn keep_child(&mut self, mv: Move) {
+        let mut c = self.tree.node(self.root).first_child.load(Ordering::Relaxed);
+        while c != NO_ID {
+            let n = self.tree.node(c);
+            if n.mv() == mv {
+                self.root = c;
+                return;
+            }
+            c = n.next_sibling.load(Ordering::Relaxed);
+        }
+        self.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evaluate;
+
+    fn cb(pos: &Position, _legal: &MoveList) -> (i32, Vec<f32>) {
+        (evaluate::evaluate(pos), Vec::new())
+    }
+
+    /// Serial (threads=1): the kept subtree must keep the old children visits.
+    #[test]
+    fn reuse_serial_keeps_subtree() {
+        crate::init();
+        let mut s = MctsSearch::new(1 << 20, 1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut pos = Position::startpos();
+        let r1 = s.search(&pos, 4000, cb, stop.clone());
+        let mv = r1.best;
+        s.keep_child(mv);
+        pos.make_move(mv);
+        let r2 = s.search(&pos, 4000, cb, stop.clone());
+        let sum2: u32 = r2.visits.iter().map(|(_, v)| v).sum();
+        assert!(sum2 > 4000, "kept subtree visits must carry over, got {sum2}");
+        assert_eq!(s.rebuilds(), 0);
+    }
+
+    /// Serial: mid-depth nodes must have expanded children with visits.
+    #[test]
+    fn serial_descends_below_root() {
+        crate::init();
+        let mut s = MctsSearch::new(65536, 1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let pos = Position::startpos();
+        s.search(&pos, 4000, cb, stop.clone());
+        let root = s.tree.node(ROOT_ID);
+        let mut total_grand_visits = 0u32;
+        let mut c = root.first_child.load(Ordering::Relaxed);
+        while c != NO_ID {
+            let n = s.tree.node(c);
+            if n.visits() > 10 {
+                let mut cc = n.first_child.load(Ordering::Relaxed);
+                while cc != NO_ID {
+                    total_grand_visits += s.tree.node(cc).visits();
+                    cc = s.tree.node(cc).next_sibling.load(Ordering::Relaxed);
+                }
+            }
+            c = n.next_sibling.load(Ordering::Relaxed);
+        }
+        assert!(total_grand_visits > 3000, "playouts must descend past depth 1, got {total_grand_visits}");
+    }
 }
 

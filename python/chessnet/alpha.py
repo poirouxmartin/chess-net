@@ -1,10 +1,10 @@
 """AlphaZero-style self-play reinforcement learning.
 
-The value head is the NNUE net (logit -> sigmoid = win prob for WHITE).
-MCTS uses a uniform prior over legal moves (no policy head yet).
-Self-play games produce (board, white_result) pairs used to train the net:
-  label = 1.0 white wins, 0.5 draw, 0.0 black wins (always white POV).
-The side to move only flips the leaf value inside MCTS, never the label.
+The value head is the NNUE net (logit -> sigmoid = win prob for WHITE) and the
+policy head outputs a logit per from*64+to move, giving MCTS learned priors
+over legal moves (softmax-masked). Self-play games produce
+(board, visits, white_result) triples: the value label is the game outcome
+(always white POV) and the policy label is the root visit distribution.
 
 Search is bulk-parallel: leaf positions of a batch of traversals are
 evaluated in a single GPU forward pass, deduplicated through a zobrist value
@@ -19,7 +19,15 @@ import random
 import chess
 import torch
 
-from .nnue import NNUE, encode_batch, FEAT_HALFKP, FEAT_KP768, HALFKP_FEAT_COUNT, KP768_FEAT_COUNT
+from .nnue import (
+    NNUE,
+    encode_batch,
+    move_policy_index,
+    FEAT_HALFKP,
+    FEAT_KP768,
+    HALFKP_FEAT_COUNT,
+    KP768_FEAT_COUNT,
+)
 
 
 def _feat_id(feat_count):
@@ -61,35 +69,28 @@ class MCTS:
         self.cache_max = cache_size
         self.root = None
 
-    def _policy_prior(self, board, legal):
-        """Heuristic prior over legal moves (captures MVV-LVA + promotions).
-        Uniform would explore every move equally; this biases the search toward
-        tactically promising moves. A learned policy head can replace it by
-        returning per-move logits (sum stays 1)."""
-        scores = []
-        for mv in legal:
-            s = 1.0
-            if board.is_capture(mv):
-                attacker = board.piece_at(mv.from_square)
-                victim = board.piece_at(mv.to_square)
-                a = attacker.piece_type if attacker else 0
-                v = victim.piece_type if victim else 0
-                s += 10.0 + v - 0.1 * a  # MVV-LVA
-            if mv.promotion:
-                s += 8.0 + mv.promotion
-            scores.append(s)
-        total = sum(scores)
-        return [s / total for s in scores]
-
-    def _expand(self, node, board):
-        """Create children for `node` from the legal moves of `board`.
+    def _expand(self, node, board, logits):
+        """Create children for `node` from the legal moves of `board`, using
+        the policy logits (4096-vector from the net) as masked-softmax priors.
         Returns False when the position is terminal (mate/stalemate)."""
         legal = list(board.legal_moves)
         if not legal:
             return False
-        for mv, p in zip(legal, self._policy_prior(board, legal)):
+        inds = torch.tensor([move_policy_index(m) for m in legal])
+        probs = torch.softmax(logits[inds], dim=0)
+        for mv, p in zip(legal, probs.tolist()):
             node.children[mv] = MCTSNode(parent=node, move=mv, prior=p)
         return True
+
+    def _forward(self, boards):
+        """Batched net eval: returns (white_win_probs, policy_logits) as CPU
+        tensors, aligned with `boards`."""
+        idx, mask = encode_batch(boards, self.feat)
+        with torch.no_grad():
+            logits, policy = self.net.forward_with_policy(
+                idx.to(self.device), mask.to(self.device)
+            )
+        return torch.sigmoid(logits).flatten().cpu(), policy.cpu()
 
     def _ucb(self, node):
         q = node.value / max(1, node.visits)
@@ -99,8 +100,10 @@ class MCTS:
     def search(self, board, iterations):
         if self.root is None:
             self.root = MCTSNode()
-        if not self.root.children and not self._expand(self.root, board):
-            return {}
+        if not self.root.children:
+            _, policy = self._forward([board])
+            if not self._expand(self.root, board, policy[0]):
+                return {}
         remaining = iterations
         while remaining > 0:
             b = min(self.batch_size, remaining)
@@ -125,15 +128,14 @@ class MCTS:
 
     def _evaluate_and_backup(self, board, leaves):
         # board is at the root here. Replay each path to materialize the leaf
-        # board, expand it, dedupe net evals by zobrist, then backup.
+        # board, detect terminals, dedupe net evals by zobrist, then expand the
+        # non-terminal leaves with their policy logits and backup.
         ready = []  # (node, path, stm_value)
         to_forward = []  # (node, path, turn, zkey, leaf_board)
         for node, path in leaves:
             for n in path[1:]:
                 board.push(n.move)
-            if not node.children:
-                self._expand(node, board)
-            if not node.children:
+            if not node.children and not any(board.legal_moves):
                 # Terminal leaf: mate (0.0) or stalemate (0.5) for the stm.
                 ready.append((node, path, 0.0 if board.is_checkmate() else 0.5))
             else:
@@ -147,13 +149,12 @@ class MCTS:
                 board.pop()
 
         if to_forward:
-            idx, mask = encode_batch([t[4] for t in to_forward], self.feat)
-            with torch.no_grad():
-                logits = self.net(idx.to(self.device), mask.to(self.device))
-                white_wins = torch.sigmoid(logits).flatten()
-            for (node, path, turn, zkey, _), ww in zip(to_forward, white_wins):
+            values, policies = self._forward([t[4] for t in to_forward])
+            for (node, path, turn, zkey, leaf_board), ww, pl in zip(to_forward, values, policies):
                 ww = ww.item()
                 self.cache[zkey] = ww
+                if not node.children:
+                    self._expand(node, leaf_board, pl)
                 ready.append((node, path, ww if turn == chess.WHITE else 1.0 - ww))
             if len(self.cache) >= self.cache_max:
                 self.cache.clear()
@@ -202,7 +203,9 @@ def pick_move(visits, temp=1.0):
 
 
 def play_game(net, iterations, device, max_plies=400, temp=1.0, temp_drop=12, batch_size=64, c_puct=1.4):
-    """Self-play one game. Returns list of (board, white_result) data pairs."""
+    """Self-play one game. Returns list of (board_fen, visits, white_result)
+    triples: `visits` is the root visit distribution {uci: count} used as the
+    policy label, `white_result` in {1.0, 0.5, 0.0} is the value label."""
     board = chess.Board()
     history = []
     search = MCTS(net, device, c_puct=c_puct, batch_size=batch_size)
@@ -213,7 +216,7 @@ def play_game(net, iterations, device, max_plies=400, temp=1.0, temp_drop=12, ba
             break
         t = temp if ply < temp_drop else 0.0
         move = pick_move(visits, t)
-        history.append(board.copy())
+        history.append((board.copy(), {m.uci(): v for m, v in visits.items()}))
         board.push(move)
         search.make_move(move)
         ply += 1
@@ -225,9 +228,9 @@ def play_game(net, iterations, device, max_plies=400, temp=1.0, temp_drop=12, ba
         white_result = 0.0  # draw / insufficient material / stalemate / repetition
 
     data = []
-    for b in history:
+    for b, visits in history:
         # Labels are always in WHITE's perspective: 1.0/0.5/0.0.
-        data.append((b.fen(), (white_result + 1.0) / 2.0))
+        data.append((b.fen(), visits, (white_result + 1.0) / 2.0))
     return data
 
 
@@ -264,10 +267,15 @@ class AlphaTrainer:
             data.extend(play_game(self.net, iterations, self.device))
         return data
 
-    def train(self, data, epochs=1, batch_size=1024):
-        boards = [chess.Board(fen) for fen, _ in data]
-        labels = torch.tensor([y for _, y in data], dtype=torch.float32)
+    def train(self, data, epochs=1, batch_size=1024, lambda_policy=1.0):
+        has_policy = len(data[0]) == 3
+        boards = [chess.Board(row[0]) for row in data]
+        labels = torch.tensor([row[-1] for row in data], dtype=torch.float32)
         idx, mask = encode_batch(boards, _feat_id(self.net.feat_count))
+        if has_policy and lambda_policy > 0:
+            # Policy targets: per position, distinct legal (from*64+to) indices
+            # and their visit-probabilities (promotion variants share an index).
+            tgt_inds, tgt_probs, tgt_mask = self._policy_targets(data)
         n = len(data)
         for _ in range(epochs):
             perm = torch.randperm(n)
@@ -276,12 +284,50 @@ class AlphaTrainer:
                 b = idx[sel].to(self.device)
                 m = mask[sel].to(self.device)
                 y = labels[sel].to(self.device)
-                logit = self.net(b, m)
+                logit, policy = self.net.forward_with_policy(b, m)
                 loss = torch.nn.functional.binary_cross_entropy_with_logits(logit, y)
+                if has_policy and lambda_policy > 0:
+                    g = policy.gather(1, tgt_inds[sel].to(self.device))
+                    g = g.masked_fill(~tgt_mask[sel].to(self.device), -float("inf"))
+                    logp = g - torch.logsumexp(g, dim=1, keepdim=True)
+                    ce = -(tgt_probs[sel].to(self.device) * logp)
+                    ce = ce.masked_fill(~tgt_mask[sel].to(self.device), 0.0)
+                    loss = loss + lambda_policy * ce.sum(dim=1).mean()
                 self.opt.zero_grad()
                 loss.backward()
                 self.opt.step()
         return self.net
+
+    def _policy_targets(self, data):
+        n = len(data)
+        inds_list, probs_list = [], []
+        for row in data:
+            b = chess.Board(row[0])
+            visits = row[1]
+            agg = {}
+            for mv in b.legal_moves:
+                cnt = visits.get(mv.uci(), 0)
+                if cnt:
+                    ind = move_policy_index(mv)
+                    agg[ind] = agg.get(ind, 0) + cnt
+            total = sum(agg.values())
+            if total <= 0:
+                inds_list.append(torch.zeros(0, dtype=torch.long))
+                probs_list.append(torch.zeros(0))
+                continue
+            inds = torch.tensor(list(agg.keys()), dtype=torch.long)
+            probs = torch.tensor([c / total for c in agg.values()])
+            inds_list.append(inds)
+            probs_list.append(probs)
+        k = max(len(t) for t in inds_list)
+        inds = torch.zeros(n, k, dtype=torch.long)
+        probs = torch.zeros(n, k)
+        mask = torch.zeros(n, k, dtype=torch.bool)
+        for i, (iv, pv) in enumerate(zip(inds_list, probs_list)):
+            inds[i, : len(iv)] = iv
+            probs[i, : len(pv)] = pv
+            mask[i, : len(iv)] = True
+        return inds, probs, mask
 
 
 def _play_worker(state, games, iterations, device, feat_count, l0, l1):
