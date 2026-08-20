@@ -127,6 +127,23 @@ pub struct Position {
     pub fullmove: u32,
     pub key: u64,
     pub king_sq: [usize; 2],
+    /// Square -> piece map: bits 0..2 = piece type, bit 6 = color, 0xFF empty.
+    /// O(1) alternative to scanning the 12 bitboards in `piece_pt_at`.
+    sq_piece: [u8; 64],
+    /// Incremental static evaluation (white perspective): material + PST
+    /// tapered totals and game phase, maintained in `add_piece`/`remove_piece`.
+    /// Lets `evaluate` avoid rescanning the 12 bitboards.
+    pub mg: i32,
+    pub eg: i32,
+    pub phase: i32,
+}
+
+/// Packed "empty square" marker for `sq_piece`.
+const SQ_EMPTY: u8 = 0xFF;
+
+#[inline(always)]
+fn sq_code(color: usize, pt: usize) -> u8 {
+    ((color as u8) << 6) | pt as u8
 }
 
 impl Position {
@@ -167,6 +184,10 @@ impl Position {
             fullmove,
             key: 0,
             king_sq: [0; 2],
+            sq_piece: [SQ_EMPTY; 64],
+            mg: 0,
+            eg: 0,
+            phase: 0,
         };
 
         let mut rank = 7usize;
@@ -290,40 +311,35 @@ impl Position {
 
     #[inline(always)]
     pub fn piece_at(&self, sq: usize) -> Option<(usize, usize)> {
-        let b = bit(sq);
-        if self.occ & b == 0 {
-            return None;
+        let v = self.sq_piece[sq];
+        if v == SQ_EMPTY {
+            None
+        } else {
+            Some((((v >> 6) & 1) as usize, (v & 0x07) as usize))
         }
-        for c in 0..2 {
-            for pt in 0..PIECE_TYPES {
-                if self.pieces[c * PIECE_TYPES + pt] & b != 0 {
-                    return Some((c, pt));
-                }
-            }
-        }
-        None
     }
 
+    /// Piece type on `sq` (either color). `sq` must be occupied.
     #[inline(always)]
     pub fn piece_pt_at(&self, sq: usize) -> usize {
-        let b = bit(sq);
-        for pt in 0..PIECE_TYPES {
-            if self.pieces[self.side * PIECE_TYPES + pt] & b != 0 {
-                return pt;
-            }
-        }
-        for pt in 0..PIECE_TYPES {
-            if self.pieces[(self.side ^ 1) * PIECE_TYPES + pt] & b != 0 {
-                return pt;
-            }
-        }
-        KING // unreachable for occupied square
+        (self.sq_piece[sq] & 0x07) as usize
+    }
+
+    /// Color of the piece on `sq`. `sq` must be occupied.
+    #[inline(always)]
+    pub fn piece_color_at(&self, sq: usize) -> usize {
+        ((self.sq_piece[sq] >> 6) & 1) as usize
     }
 
     fn add_piece(&mut self, color: usize, sq: usize, pt: usize) {
         let idx = Self::piece_idx(color, pt);
         self.pieces[idx] |= bit(sq);
         self.occ |= bit(sq);
+        self.sq_piece[sq] = sq_code(color, pt);
+        let (mg, eg, ph) = crate::evaluate::piece_eval_delta(color, sq, pt);
+        self.mg += mg;
+        self.eg += eg;
+        self.phase += ph;
         self.key ^= zob().piece[color][pt][sq];
         if pt == KING {
             self.king_sq[color] = sq;
@@ -334,6 +350,11 @@ impl Position {
         let idx = Self::piece_idx(color, pt);
         self.pieces[idx] &= !bit(sq);
         self.occ &= !bit(sq);
+        self.sq_piece[sq] = SQ_EMPTY;
+        let (mg, eg, ph) = crate::evaluate::piece_eval_delta(color, sq, pt);
+        self.mg -= mg;
+        self.eg -= eg;
+        self.phase -= ph;
         self.key ^= zob().piece[color][pt][sq];
         if pt == KING {
             self.king_sq[color] = usize::MAX;

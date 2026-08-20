@@ -520,6 +520,14 @@ pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> M
                     }
                 }
             }
+        } else if let Some(ps) = step_sq(sq, forward) {
+            // Quiet promotions are material gains and must be seen by the
+            // quiescence search even in captures-only mode.
+            if empty & bit(ps) != 0 && rank_of(ps) == promo_rank {
+                for p in [PROMO_QUEEN, PROMO_ROOK, PROMO_BISHOP, PROMO_KNIGHT] {
+                    list.push(Move::new(sq, ps, p, FLAG_PROMO).with_piece(PAWN));
+                }
+            }
         }
 
         let mut cb = pawn_attacks(us, sq) & enemies;

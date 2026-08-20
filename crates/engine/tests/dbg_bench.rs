@@ -217,6 +217,46 @@ fn bench_search() {
 }
 
 #[test]
+fn prof_search() {
+    engine::init();
+    use engine::search::PROF;
+    for mb in [64usize, 4, 2, 1] {
+        let mut pos = Position::startpos();
+        let stop = AtomicBool::new(false);
+        let mut s = Searcher::new(mb);
+        let t = Instant::now();
+        let r = s.think(&mut pos, &Limits { depth: Some(12), ..Default::default() }, &stop, evaluate);
+        let dt = t.elapsed().as_secs_f64();
+        println!(
+            "tt={}MB depth 12: {} nodes in {:.3}s = {:.1} Mn/s best {}",
+            mb, r.nodes, dt, r.nodes as f64 / dt / 1e6, r.best.0
+        );
+    }
+    let mut pos = Position::startpos();
+    let stop = AtomicBool::new(false);
+    let mut s = Searcher::new(64);
+    let t = Instant::now();
+    let r = s.think(&mut pos, &Limits { depth: Some(9), ..Default::default() }, &stop, evaluate);
+    let dt = t.elapsed().as_secs_f64();
+    let n = r.nodes as f64;
+    println!("nodes {} in {:.3}s = {:.1} Mn/s best {}", r.nodes, dt, r.nodes as f64 / dt / 1e6, r.best.0);
+    let load = |v: u64| v as f64 / n;
+    println!(
+        "negamax {:.1} qnode {:.1} | movegen {:.1} movegen_q {:.1} | order {:.1} order_cap {:.1} | make {:.1} make_q {:.1} | see {:.1} rep {:.1}",
+        load(PROF.negamax.load(Ordering::Relaxed)),
+        load(PROF.qnode.load(Ordering::Relaxed)),
+        load(PROF.movegen.load(Ordering::Relaxed)),
+        load(PROF.movegen_q.load(Ordering::Relaxed)),
+        load(PROF.order.load(Ordering::Relaxed)),
+        load(PROF.order_cap.load(Ordering::Relaxed)),
+        load(PROF.make.load(Ordering::Relaxed)),
+        load(PROF.make_q.load(Ordering::Relaxed)),
+        load(PROF.see.load(Ordering::Relaxed)),
+        load(PROF.rep.load(Ordering::Relaxed)),
+    );
+}
+
+#[test]
 fn debug_key() {
     engine::init();
     let mut pos = Position::startpos();

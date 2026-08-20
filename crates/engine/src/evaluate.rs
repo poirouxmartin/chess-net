@@ -152,32 +152,29 @@ pub(crate) fn pst(eg: bool, pt: usize, sq: usize) -> i32 {
     table[sq]
 }
 
-/// Static evaluation in centipawns from the side-to-move perspective.
+/// White-perspective contribution of a piece, used by `Position` to maintain
+/// the incremental eval totals on add/remove.
+#[inline(always)]
+pub(crate) fn piece_eval_delta(color: usize, sq: usize, pt: usize) -> (i32, i32, i32) {
+    let s = pst_index(color, sq);
+    let sign = if color == WHITE { 1 } else { -1 };
+    let mg = sign * (MATERIAL[pt] + pst(false, pt, s));
+    let eg = sign * (MATERIAL[pt] + pst(true, pt, s));
+    let phase = match pt {
+        KNIGHT | BISHOP => 1,
+        ROOK => 2,
+        QUEEN => 4,
+        _ => 0,
+    };
+    (mg, eg, phase)
+}
+
+/// Static evaluation in centipawns from the side-to-move perspective. Reads
+/// the incremental totals maintained by `Position::add_piece/remove_piece`.
 #[inline(always)]
 pub fn evaluate(pos: &Position) -> i32 {
-    let mut mg = 0i32;
-    let mut eg = 0i32;
-    let mut phase = 0i32;
-    for c in 0..2 {
-        let sign = if c == WHITE { 1 } else { -1 };
-        for pt in 0..PIECE_TYPES {
-            let mut b = pos.piece_bb(c, pt);
-            while b != 0 {
-                let sq = crate::bitboard::pop_lsb(&mut b);
-                let s = pst_index(c, sq);
-                mg += sign * (MATERIAL[pt] + pst(false, pt, s));
-                eg += sign * (MATERIAL[pt] + pst(true, pt, s));
-                match pt {
-                    KNIGHT | BISHOP => phase += 1,
-                    ROOK => phase += 2,
-                    QUEEN => phase += 4,
-                    _ => {}
-                }
-            }
-        }
-    }
-    let phase = phase.min(PHASE_TOTAL);
-    let tapered = (mg * phase + eg * (PHASE_TOTAL - phase)) / PHASE_TOTAL;
+    let phase = pos.phase.min(PHASE_TOTAL);
+    let tapered = (pos.mg * phase + pos.eg * (PHASE_TOTAL - phase)) / PHASE_TOTAL;
     if pos.side == WHITE {
         tapered + TEMPO
     } else {

@@ -1,11 +1,13 @@
 //! Alpha-beta search: iterative deepening, PVS, quiescence, TT, killers,
 //! history heuristic, null-move pruning, time management.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::cmp::Reverse;
 use std::time::{Duration, Instant};
 
-use crate::bitboard::bit;
+use crate::bitboard::{bit, pop_lsb};
+use crate::attack::{knight_attacks, pawn_attacks};
+use crate::magic::{bishop_attacks, queen_attacks, rook_attacks};
 use crate::evaluate::{MATE, INF};
 use crate::movegen::{generate_legal, generate_pseudo, MoveList};
 use crate::move_::Move;
@@ -13,6 +15,34 @@ use crate::position::*;
 use crate::tt::{TT, FLAG_EXACT, FLAG_LOWER, FLAG_UPPER};
 
 pub const MAX_PLY: usize = 128;
+
+/// Temporary per-search counters (composition profiling). Not part of the
+/// engine contract; removed once the NPS bottleneck is identified.
+pub static PROF: Prof = Prof {
+    negamax: AtomicU64::new(0),
+    qnode: AtomicU64::new(0),
+    movegen: AtomicU64::new(0),
+    movegen_q: AtomicU64::new(0),
+    order: AtomicU64::new(0),
+    order_cap: AtomicU64::new(0),
+    make: AtomicU64::new(0),
+    make_q: AtomicU64::new(0),
+    see: AtomicU64::new(0),
+    rep: AtomicU64::new(0),
+};
+
+pub struct Prof {
+    pub negamax: AtomicU64,
+    pub qnode: AtomicU64,
+    pub movegen: AtomicU64,
+    pub movegen_q: AtomicU64,
+    pub order: AtomicU64,
+    pub order_cap: AtomicU64,
+    pub make: AtomicU64,
+    pub make_q: AtomicU64,
+    pub see: AtomicU64,
+    pub rep: AtomicU64,
+}
 
 pub type EvalFn = fn(&Position) -> i32;
 
@@ -78,10 +108,69 @@ pub struct Searcher {
     start: Instant,
     budget: Duration,
     /// Keys of the positions in the current line (pushed after each move).
-    key_hist: Vec<u64>,
+    key_hist: [u64; MAX_PLY],
+    key_hist_len: usize,
+    /// Scratch sort scores for `order_moves`/`order_captures`. Reused so the
+    /// hot path never zeroes a fresh 1 KB array per node.
+    scratch: [i32; 256],
 }
 
 const PIECE_ORDER: [i32; 6] = [1, 2, 3, 4, 5, 6]; // P,N,B,R,Q,K for MVV-LVA
+/// Piece values in centipawns, indexed by piece type (P=0..K=5). Used by SEE
+/// and delta pruning. The king is never a recapture target in SEE.
+const SEE_VAL: [i32; 6] = [100, 320, 330, 500, 900, 0];
+
+/// Least valuable piece of `side` that attacks square `to` under occupancy
+/// `occ` (sliding rays re-open as pieces are removed). Returns 0 if none.
+fn see_attacker(pos: &Position, to: usize, side: usize, occ: u64) -> usize {
+    for pt in [PAWN, KNIGHT, BISHOP, ROOK, QUEEN] {
+        let mut bb = match pt {
+            PAWN => pawn_attacks(side ^ 1, to) & pos.piece_bb(side, PAWN) & occ,
+            KNIGHT => knight_attacks(to) & pos.piece_bb(side, KNIGHT) & occ,
+            _ => {
+                let mut b = pos.piece_bb(side, pt) & occ;
+                let mut hit = 0;
+                while b != 0 {
+                    let sq = pop_lsb(&mut b);
+                    let attacks = match pt {
+                        BISHOP => bishop_attacks(sq, occ),
+                        ROOK => rook_attacks(sq, occ),
+                        _ => queen_attacks(sq, occ),
+                    };
+                    if attacks & bit(to) != 0 {
+                        hit = bit(sq);
+                        break;
+                    }
+                }
+                hit
+            }
+        };
+        if bb != 0 {
+            return pop_lsb(&mut bb);
+        }
+    }
+    0
+}
+
+/// Value of the exchange on `to` when `side` is to recapture the piece
+/// `victim` standing on `to` under occupancy `occ`. Both sides recapture with
+/// their cheapest attacker and may decline if the recapture loses material.
+fn see_rec(pos: &Position, to: usize, victim: usize, side: usize, occ: u64) -> i32 {
+    let att = see_attacker(pos, to, side, occ);
+    if att == 0 {
+        return 0;
+    }
+    let value = SEE_VAL[victim];
+    let gain = value - see_rec(pos, to, pos.piece_pt_at(att), side ^ 1, occ & !bit(att));
+    gain.max(0)
+}
+
+/// Static exchange evaluation of a capture from `from` to `to`: the net
+/// material balance for the side to move (negative = losing capture).
+pub fn see(pos: &Position, from: usize, to: usize) -> i32 {
+    let value = SEE_VAL[pos.piece_pt_at(to)];
+    value - see_rec(pos, to, pos.piece_pt_at(from), pos.side ^ 1, pos.occ & !bit(from))
+}
 
 impl Searcher {
     pub fn new(hash_mb: usize) -> Self {
@@ -95,7 +184,9 @@ impl Searcher {
             nodes: 0,
             start: Instant::now(),
             budget: Duration::from_secs(3600),
-            key_hist: Vec::new(),
+            key_hist: [0; MAX_PLY],
+            key_hist_len: 0,
+            scratch: [0; 256],
         }
     }
 
@@ -116,7 +207,7 @@ impl Searcher {
         self.budget = compute_budget(pos, limits);
         self.start = Instant::now();
         self.nodes = 0;
-        self.key_hist.clear();
+        self.key_hist_len = 0;
 
         for k in &mut self.killers {
             *k = [Move::null(); 2];
@@ -137,11 +228,40 @@ impl Searcher {
         let mut pv = Vec::new();
         let mut lines = Vec::new();
 
+        let mut prev = 0i32;
         for d in 1..=max_depth {
-            let r = self.root_search(pos, d as i32, stop, eval);
+            // Aspiration windows from depth 6 on: search around the previous
+            // iteration's score. On a fail, re-center the window on the fail
+            // score and widen (never fall back to a full window), so the
+            // re-search stays narrow and the node cost of a re-search is small.
+            let aspire = d >= 6 && (MATE - prev).abs() > MAX_PLY as i32;
+            let mut delta = 25i32;
+            let (mut alpha, mut beta) = if aspire {
+                ((prev - delta).max(-INF), (prev + delta).min(INF))
+            } else {
+                (-INF, INF)
+            };
+            let mut r;
+            loop {
+                r = self.root_search(pos, d as i32, alpha, beta, stop, eval);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if r.score >= beta {
+                    beta = (r.score + delta).min(INF);
+                    alpha = (alpha + beta) / 2;
+                } else if r.score <= alpha {
+                    alpha = (r.score - delta).max(-INF);
+                    beta = (alpha + beta) / 2;
+                } else {
+                    break;
+                }
+                delta += delta / 2;
+            }
             best = r.best;
             score = r.score;
             done = d as i32;
+            prev = score;
             pv = self.pv_table[0][..self.pv_len[0]].to_vec();
             if multi > 1 {
                 lines = self.compute_multi_pv(pos, d as i32, stop, eval, multi);
@@ -175,9 +295,9 @@ impl Searcher {
         }
     }
 
-    fn root_search(&mut self, pos: &mut Position, depth: i32, stop: &AtomicBool, eval: EvalFn) -> RootResult {
+    fn root_search(&mut self, pos: &mut Position, depth: i32, alpha: i32, beta: i32, stop: &AtomicBool, eval: EvalFn) -> RootResult {
         let mut moves = generate_legal(pos);
-        let tt_move = if self.use_tt { self.tt.probe(pos.key).map(|e| Move(e.mv)) } else { None };
+        let tt_move = if self.use_tt { self.tt.probe(pos.key).map(|e| e.mv_move()) } else { None };
         self.order_moves(pos, &mut moves, tt_move, 0);
 
         if moves.len == 0 {
@@ -187,8 +307,7 @@ impl Searcher {
             };
         }
 
-        let mut alpha = -INF;
-        let beta = INF;
+        let mut alpha = alpha;
         let mut best_move = moves.get(0);
         self.pv_len[0] = 0;
 
@@ -196,18 +315,19 @@ impl Searcher {
             let m = moves.get(i);
             let undo = pos.make_move(m);
             self.nodes += 1;
-            self.key_hist.push(pos.key);
+            self.key_hist[self.key_hist_len] = pos.key;
+            self.key_hist_len += 1;
             let s = if i == 0 {
                 -self.negamax(pos, depth - 1, -beta, -alpha, 1, stop, eval)
             } else {
                 let s = -self.negamax(pos, depth - 1, -alpha - 1, -alpha, 1, stop, eval);
-                if s > alpha {
+                if s > alpha && s < beta {
                     -self.negamax(pos, depth - 1, -beta, -alpha, 1, stop, eval)
                 } else {
                     s
                 }
             };
-            self.key_hist.pop();
+            self.key_hist_len -= 1;
             pos.unmake_move(undo);
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -252,9 +372,10 @@ impl Searcher {
             let m = moves.get(i);
             self.pv_len[1] = 0;
             let undo = pos.make_move(m);
-            self.key_hist.push(pos.key);
+            self.key_hist[self.key_hist_len] = pos.key;
+            self.key_hist_len += 1;
             let s = -self.negamax(pos, depth - 1, -INF, INF, 1, stop, eval);
-            self.key_hist.pop();
+            self.key_hist_len -= 1;
             pos.unmake_move(undo);
             let mut pv = vec![m];
             pv.extend_from_slice(&self.pv_table[1][..self.pv_len[1]]);
@@ -303,6 +424,7 @@ impl Searcher {
         eval: EvalFn,
     ) -> i32 {
         self.nodes += 1;
+        PROF.negamax.fetch_add(1, Ordering::Relaxed);
         // Reset the PV slot first: any early return (time-up, TT cutoff,
         // null-move, RFP, quiescence, mate) leaves `pv_len[ply] == 0` so the
         // parent never copies a stale PV from an unrelated position.
@@ -312,6 +434,7 @@ impl Searcher {
         }
 
         if ply > 0 {
+            PROF.rep.fetch_add(1, Ordering::Relaxed);
             if pos.halfmove >= 100 || self.is_repetition(pos.key, pos.halfmove) {
                 return 0;
             }
@@ -325,8 +448,8 @@ impl Searcher {
         let key = pos.key;
         let tt_move = match if self.use_tt { self.tt.probe(key) } else { None } {
             Some(e) => {
-                if ply > 0 && (e.depth as i32) >= depth {
-                    match e.flag {
+                if ply > 0 && e.depth() >= depth {
+                    match e.flag() {
                         FLAG_EXACT => return Self::score_from_tt(e.score, ply),
                         FLAG_LOWER => {
                             if e.score >= beta {
@@ -341,7 +464,7 @@ impl Searcher {
                         _ => {}
                     }
                 }
-                Some(Move(e.mv))
+                Some(e.mv_move())
             }
             None => None,
         };
@@ -379,6 +502,7 @@ impl Searcher {
         let mut best = -INF;
         let mut best_move = Move::null();
         let mut alpha0 = alpha;
+        let mut pruned = false;
 
         // TT move first: searched before any movegen/ordering. A cutoff here
         // skips generation entirely (the common cut-node case). The move is
@@ -395,12 +519,14 @@ let mut searched: Option<Move> = None;
                 || tt_m.from() == king
                 || (pinned & bit(tt_m.from()) != 0);
             let undo = pos.make_move(tt_m);
+            PROF.make.fetch_add(1, Ordering::Relaxed);
             if verify && !pos.king_safe(us) {
                 pos.unmake_move(undo);
             } else {
-                self.key_hist.push(pos.key);
+                self.key_hist[self.key_hist_len] = pos.key;
+            self.key_hist_len += 1;
                 let s = -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval);
-                self.key_hist.pop();
+                self.key_hist_len -= 1;
                 pos.unmake_move(undo);
                 if stop.load(Ordering::Relaxed) {
                     return 0;
@@ -436,11 +562,13 @@ let mut searched: Option<Move> = None;
         }
 
         let mut moves = generate_pseudo(pos, false, in_check);
+        PROF.movegen.fetch_add(1, Ordering::Relaxed);
         if moves.len == 0 {
             return if in_check { -MATE + ply as i32 } else { 0 };
         }
 
         self.order_moves(pos, &mut moves, tt_move, ply);
+        PROF.order.fetch_add(1, Ordering::Relaxed);
 
         for i in 0..moves.len {
             let m = moves.get(i);
@@ -469,12 +597,30 @@ let mut searched: Option<Move> = None;
                 || m.is_en_passant()
                 || m.from() == king
                 || (pinned & bit(m.from()) != 0);
+            // Shallow node pruning for quiet moves: at low depth a quiet move
+            // whose static evaluation is far below alpha cannot improve it
+            // (futility), and late quiet moves are unlikely to matter (LMP).
+            // Skipped near mate, when in check, or for the TT/killer moves
+            // that are already searched before the loop. Runs before the
+            // make_move below: pruned moves never touch the board.
+            if !in_check && m.is_quiet() && depth <= 3 && alpha0 > -MATE + MAX_PLY as i32 {
+                if !have_eval {
+                    eval_cache = eval(pos);
+                    have_eval = true;
+                }
+                if eval_cache + 110 * depth <= alpha0 || idx >= (5 + depth * depth) as usize {
+                    pruned = true;
+                    continue;
+                }
+            }
             let undo = pos.make_move(m);
+            PROF.make.fetch_add(1, Ordering::Relaxed);
             if verify && !pos.king_safe(us) {
                 pos.unmake_move(undo);
                 continue;
             }
-            self.key_hist.push(pos.key);
+            self.key_hist[self.key_hist_len] = pos.key;
+            self.key_hist_len += 1;
             let s = if i == 0 && searched.is_none() {
                 -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval)
             } else {
@@ -493,7 +639,7 @@ let mut searched: Option<Move> = None;
                     s
                 }
             };
-            self.key_hist.pop();
+            self.key_hist_len -= 1;
             pos.unmake_move(undo);
             if stop.load(Ordering::Relaxed) {
                 return 0;
@@ -530,6 +676,11 @@ let mut searched: Option<Move> = None;
             FLAG_EXACT
         };
         if best == -INF {
+            // Some moves were skipped by futility/LMP: the position has legal
+            // moves, so the node is a fail-low bound, not a terminal node.
+            if pruned {
+                return alpha0;
+            }
             // Every pseudo-move was illegal: the position is mate or
             // stalemate even though generate_pseudo was non-empty. Without
             // this the node would return -INF and store a null TT move.
@@ -551,6 +702,7 @@ let mut searched: Option<Move> = None;
         eval: EvalFn,
     ) -> i32 {
         self.nodes += 1;
+        PROF.qnode.fetch_add(1, Ordering::Relaxed);
         // Same PV-slot reset as negamax: a quiescence leaf is never part of a
         // PV, so a stale length from an earlier position must not leak up.
         self.pv_len[ply] = 0;
@@ -570,11 +722,13 @@ let mut searched: Option<Move> = None;
         }
 
         let mut moves = generate_pseudo(pos, !in_check, in_check);
+        PROF.movegen_q.fetch_add(1, Ordering::Relaxed);
         if moves.len == 0 {
             return if in_check { -MATE + ply as i32 } else { alpha };
         }
 
         self.order_captures(pos, &mut moves);
+        PROF.order_cap.fetch_add(1, Ordering::Relaxed);
 
         let mut best = if in_check { -INF } else { alpha };
         let mut alpha0 = if in_check { -INF } else { alpha };
@@ -588,7 +742,22 @@ let mut searched: Option<Move> = None;
                 || m.is_en_passant()
                 || m.from() == king
                 || (pinned & bit(m.from()) != 0);
+            // Skip losing captures without touching the board. Delta pruning
+            // rejects captures that cannot reach alpha even if free; SEE
+            // rejects captures that lose material. Evasions and promotions
+            // (whose gain can exceed the victim) are always searched.
+            if !in_check && m.is_capture() && !m.is_en_passant() && !m.is_promotion() {
+                let victim = pos.piece_pt_at(m.to());
+                if stand + SEE_VAL[victim] + 200 < alpha0 {
+                    continue;
+                }
+                PROF.see.fetch_add(1, Ordering::Relaxed);
+                if see(pos, m.from(), m.to()) < 0 {
+                    continue;
+                }
+            }
             let undo = pos.make_move(m);
+            PROF.make_q.fetch_add(1, Ordering::Relaxed);
             if verify && !pos.king_safe(us) {
                 pos.unmake_move(undo);
                 continue;
@@ -615,9 +784,37 @@ let mut searched: Option<Move> = None;
     }
 
     pub fn order_moves(&mut self, pos: &Position, moves: &mut MoveList, tt_move: Option<Move>, ply: usize) {
-        let mut scores = [0i32; 256];
+        let scores = &mut self.scratch[..moves.len];
         for i in 0..moves.len {
-            scores[i] = self.move_score(pos, moves.get(i), tt_move, ply);
+            let m = moves.get(i);
+            let mut s = 0;
+            if tt_move == Some(m) {
+                s = 1_000_000;
+            } else {
+                if m.is_promotion() {
+                    s += 800_000 + PIECE_ORDER[m.promo_pt()];
+                }
+                if m.is_capture() {
+                    let victim = if m.is_en_passant() {
+                        PAWN
+                    } else {
+                        pos.piece_pt_at(m.to())
+                    };
+                    let attacker = if m.is_promotion() {
+                        PAWN
+                    } else {
+                        pos.piece_pt_at(m.from())
+                    };
+                    s += 500_000 + PIECE_ORDER[victim] * 16 - PIECE_ORDER[attacker];
+                }
+                if self.killers[ply][0] == m {
+                    s += 300_000;
+                } else if self.killers[ply][1] == m {
+                    s += 290_000;
+                }
+                s += self.history[pos.side][m.from()][m.to()];
+            }
+            scores[i] = s;
         }
         for i in 1..moves.len {
             let key = scores[i];
@@ -633,11 +830,13 @@ let mut searched: Option<Move> = None;
         }
     }
 
-    fn order_captures(&self, pos: &Position, moves: &mut MoveList) {
-        let mut scores = [0i32; 256];
+    fn order_captures(&mut self, pos: &Position, moves: &mut MoveList) {
+        let scores = &mut self.scratch[..moves.len];
         for i in 0..moves.len {
             let m = moves.get(i);
-            scores[i] = if m.is_capture() {
+            scores[i] = if m.is_promotion() {
+                700_000 + PIECE_ORDER[m.promo_pt()]
+            } else if m.is_capture() {
                 let victim = if m.is_en_passant() {
                     PAWN
                 } else {
@@ -663,36 +862,6 @@ let mut searched: Option<Move> = None;
         }
     }
 
-    fn move_score(&self, pos: &Position, m: Move, tt_move: Option<Move>, ply: usize) -> i32 {
-        if tt_move == Some(m) {
-            return 1_000_000;
-        }
-        let mut s = 0;
-        if m.is_promotion() {
-            s += 800_000 + PIECE_ORDER[m.promo_pt()];
-        }
-        if m.is_capture() {
-            let victim = if m.is_en_passant() {
-                PAWN
-            } else {
-                pos.piece_pt_at(m.to())
-            };
-            let attacker = if m.is_promotion() {
-                PAWN
-            } else {
-                pos.piece_pt_at(m.from())
-            };
-            s += 500_000 + PIECE_ORDER[victim] * 16 - PIECE_ORDER[attacker];
-        }
-        if self.killers[ply][0] == m {
-            s += 300_000;
-        } else if self.killers[ply][1] == m {
-            s += 290_000;
-        }
-        s += self.history[pos.side][m.from()][m.to()];
-        s
-    }
-
     fn update_history(&mut self, pos: &Position, m: Move, depth: i32) {
         let h = &mut self.history[pos.side][m.from()][m.to()];
         *h += depth * depth;
@@ -711,10 +880,10 @@ let mut searched: Option<Move> = None;
     /// cannot recur across an irreversible move, so earlier entries cannot
     /// match.
     fn is_repetition(&self, key: u64, halfmove: u32) -> bool {
-        let len = self.key_hist.len();
+        let len = self.key_hist_len;
         let start = len.saturating_sub(halfmove as usize + 1);
         let mut count = 0;
-        for &h in &self.key_hist[start..] {
+        for &h in &self.key_hist[start..len] {
             if h == key {
                 count += 1;
                 if count >= 2 {
@@ -752,4 +921,52 @@ fn compute_budget(pos: &Position, limits: &Limits) -> Duration {
         return Duration::from_millis(budget);
     }
     Duration::from_secs(3600)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::move_::parse_sq;
+
+    fn see_fen(fen: &str, from: &str, to: &str) -> i32 {
+        crate::position::init();
+        crate::attack::init();
+        crate::magic::init();
+        let pos = Position::from_fen(fen);
+        see(&pos, parse_sq(from), parse_sq(to))
+    }
+
+    #[test]
+    fn see_undefended_pawn() {
+        assert_eq!(see_fen("4k3/8/8/8/8/8/4p3/2N1K3 w - - 0 1", "c1", "e2"), 100);
+    }
+
+    #[test]
+    fn see_queen_defended_by_pawn() {
+        // White pawn captures a queen defended by a black pawn: +900 - 100.
+        assert_eq!(see_fen("4k3/8/7p/6q1/5P2/8/8/4K3 w - - 0 1", "f4", "g5"), 800);
+    }
+
+    #[test]
+    fn see_queen_defended_by_knight() {
+        // QxQ then NxQ: equal exchange.
+        assert_eq!(see_fen("3qk3/8/4n3/8/8/8/8/2Q1K3 w - - 0 1", "c1", "d8"), 0);
+    }
+
+    #[test]
+    fn see_rook_defended_by_rook() {
+        // QxR then RxQ: white nets +500 - 900 = -400 (bad capture).
+        assert_eq!(see_fen("3rr2k/8/8/8/8/8/8/3Q3K w - - 0 1", "d1", "e8"), -400);
+    }
+
+    #[test]
+    fn see_queen_trade_with_recapture() {
+        // QxR, RxQ, RxR: white nets +500 - 900 + 500 = +100.
+        assert_eq!(see_fen("3r1r1k/8/8/8/8/8/3R4/R2QK3 w - - 0 1", "d1", "d8"), 100);
+    }
+
+    #[test]
+    fn see_queen_captures_undefended_rook() {
+        assert_eq!(see_fen("4r2k/8/8/8/8/8/8/3Q3K w - - 0 1", "d1", "e8"), 500);
+    }
 }
