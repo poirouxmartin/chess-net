@@ -10,6 +10,7 @@ use crate::movegen::generate_legal;
 use crate::move_::Move;
 use crate::position::Position;
 use crate::search::{Limits, SearchResult, Searcher, EvalFn};
+use crate::tt::TT;
 
 static EVAL_FN: Mutex<Option<EvalFn>> = Mutex::new(None);
 
@@ -30,6 +31,7 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
     let mut search: Option<thread::JoinHandle<()>> = None;
     let mut pos = Position::startpos();
     let mut hash_mb = 32;
+    let mut threads: usize = 1;
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -45,6 +47,7 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
                 out("id name chess-net");
                 out("id author chess-net");
                 out("option name Hash type spin default 32 min 1 max 4096");
+                out("option name Threads type spin default 1 min 1 max 64");
                 out("option name EvalFile type string default <empty>");
                 out("uciok");
             }
@@ -75,6 +78,10 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
                     if let Ok(v) = value.parse() {
                         hash_mb = v;
                     }
+                } else if name == "Threads" {
+                    if let Ok(v) = value.parse::<usize>() {
+                        threads = v.max(1);
+                    }
                 } else if name == "EvalFile" {
                     if let Some(h) = hook {
                         if h("EvalFile", &value) {
@@ -91,14 +98,13 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
                 join(&mut search);
                 stop.store(false, Ordering::Relaxed);
                 let limits = parse_go(&tokens[1..]);
-                let mut target = pos.clone();
-                let s = stop.clone();
                 let eval = (*EVAL_FN.lock().unwrap()).unwrap_or(evaluate);
                 let hash = hash_mb;
+                let n_threads = threads;
+                let stop_clone = stop.clone();
+                let pos_clone = pos.clone();
                 search = Some(thread::spawn(move || {
-                    let mut searcher = Searcher::new(hash);
-                    let r = searcher.think(&mut target, &limits, &s, eval);
-                    report(&r);
+                    lazy_smp_search(pos_clone, limits, stop_clone, eval, hash, n_threads);
                 }));
             }
             "stop" => {
@@ -145,6 +151,47 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
             }
             _ => {}
         }
+    }
+}
+
+fn lazy_smp_search(
+    pos: Position,
+    limits: Limits,
+    stop: Arc<AtomicBool>,
+    eval: EvalFn,
+    hash_mb: usize,
+    n_threads: usize,
+) {
+    let tt = Arc::new(TT::new(hash_mb));
+    let best = Arc::new(Mutex::<Option<SearchResult>>::new(None));
+    let handles: Vec<_> = (0..n_threads)
+        .map(|t| {
+            let tt = tt.clone();
+            let stop = stop.clone();
+            let limits = limits.clone();
+            let pos = pos.clone();
+            let best = best.clone();
+            let offset = if t == 0 { 0 } else { (t as i32 & 1) | (((t as i32) >> 1) & 1) };
+            thread::spawn(move || {
+                let mut pos = pos;
+                let mut s = Searcher::with_tt(tt, offset);
+                let r = s.think(&mut pos, &limits, &stop, eval);
+                let mut guard = best.lock().unwrap();
+                let dominated = guard.as_ref().map_or(true, |old| {
+                    r.score > old.score || (r.score == old.score && r.depth > old.depth)
+                });
+                if dominated {
+                    *guard = Some(r);
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        let _ = h.join();
+    }
+    let result = best.lock().unwrap().take();
+    if let Some(r) = result {
+        report(&r);
     }
 }
 

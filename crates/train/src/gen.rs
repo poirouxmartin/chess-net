@@ -67,7 +67,7 @@ fn play_game(rng: &mut Rng, search: &mut MctsSearch, opts: &GenOptions, feat: u3
         if legal.len == 0 {
             break;
         }
-        let res = search.search(&pos, opts.iters as u64, nn::evaluate_loaded_combined, stop.clone());
+        let res = search.search(&pos, opts.iters as u64, nn::evaluate_loaded_combined, stop.clone(), true, 1.0);
         if res.visits.is_empty() {
             break;
         }

@@ -99,7 +99,7 @@ fn micro_bench() {
     let mut tt_acc = 0u32;
     let t = Instant::now();
     for i in 0..20_000_000u64 {
-        tt_acc = tt_acc.wrapping_add(s.tt.probe(pos.key ^ i).map_or(0, |e| e.mv));
+        tt_acc = tt_acc.wrapping_add(s.tt.probe(pos.key ^ i).map_or(0, |e| e.1.0 as u32));
     }
     let dt = t.elapsed().as_secs_f64();
     println!("tt probe (miss): {:.1}M/s ({:.2} ns) acc={}", 2e7 / dt / 1e6, dt * 1e9 / 2e7, tt_acc & 0xFF);

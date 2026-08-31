@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "profiling")]
 use std::sync::atomic::AtomicU64;
 use std::cmp::Reverse;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use crate::bitboard::{bit, pop_lsb};
@@ -100,12 +101,14 @@ struct RootResult {
 }
 
 pub struct Searcher {
-    pub tt: TT,
+    pub tt: Arc<TT>,
     /// When false, the transposition table is ignored (probe/store bypassed).
     /// Used for A/B correctness checks and fair speed comparisons.
     pub use_tt: bool,
     killers: [[Move; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
+    /// Capture history: indexed by [side][from][to].
+    cap_history: [[[i32; 64]; 64]; 2],
     pv_table: Box<[[Move; MAX_PLY]; MAX_PLY]>,
     pv_len: [usize; MAX_PLY],
     nodes: u64,
@@ -117,12 +120,27 @@ pub struct Searcher {
     /// Scratch sort scores for `order_moves`/`order_captures`. Reused so the
     /// hot path never zeroes a fresh 1 KB array per node.
     scratch: [i32; 256],
+    /// Depth offset for Lazy SMP diversity (added to each iteration's depth).
+    depth_offset: i32,
 }
 
 const PIECE_ORDER: [i32; 6] = [1, 2, 3, 4, 5, 6]; // P,N,B,R,Q,K for MVV-LVA
 /// Piece values in centipawns, indexed by piece type (P=0..K=5). Used by SEE
 /// and delta pruning. The king is never a recapture target in SEE.
 const SEE_VAL: [i32; 6] = [100, 320, 330, 500, 900, 0];
+
+/// Precomputed LMR reduction table: `LMR[depth][move_index]`. Log-based like
+/// Stockfish: `0.75 + ln(d) * ln(i) / 2.25`, clamped to [0, 4].
+static LMR: LazyLock<[[i32; 64]; 64]> = LazyLock::new(|| {
+    let mut table = [[0i32; 64]; 64];
+    for d in 1..64 {
+        for i in 1..64 {
+            let r = 0.75 + (d as f64).ln() * (i as f64).ln() / 2.25;
+            table[d][i] = (r as i32).clamp(0, 4);
+        }
+    }
+    table
+});
 
 /// Least valuable piece of `side` that attacks square `to` under occupancy
 /// `occ` (sliding rays re-open as pieces are removed). Returns 0 if none.
@@ -179,10 +197,11 @@ pub fn see(pos: &Position, from: usize, to: usize) -> i32 {
 impl Searcher {
     pub fn new(hash_mb: usize) -> Self {
         Searcher {
-            tt: TT::new(hash_mb),
+            tt: Arc::new(TT::new(hash_mb)),
             use_tt: true,
             killers: [[Move::null(); 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
+            cap_history: [[[0; 64]; 64]; 2],
             pv_table: Box::new([[Move::null(); MAX_PLY]; MAX_PLY]),
             pv_len: [0; MAX_PLY],
             nodes: 0,
@@ -191,6 +210,27 @@ impl Searcher {
             key_hist: [0; MAX_PLY],
             key_hist_len: 0,
             scratch: [0; 256],
+            depth_offset: 0,
+        }
+    }
+
+    /// Create a searcher sharing the same TT (for Lazy SMP).
+    pub fn with_tt(tt: Arc<TT>, depth_offset: i32) -> Self {
+        Searcher {
+            tt,
+            use_tt: true,
+            killers: [[Move::null(); 2]; MAX_PLY],
+            history: [[[0; 64]; 64]; 2],
+            cap_history: [[[0; 64]; 64]; 2],
+            pv_table: Box::new([[Move::null(); MAX_PLY]; MAX_PLY]),
+            pv_len: [0; MAX_PLY],
+            nodes: 0,
+            start: Instant::now(),
+            budget: Duration::from_secs(3600),
+            key_hist: [0; MAX_PLY],
+            key_hist_len: 0,
+            scratch: [0; 256],
+            depth_offset,
         }
     }
 
@@ -223,6 +263,13 @@ impl Searcher {
                 }
             }
         }
+        for ch in self.cap_history.iter_mut() {
+            for r in ch.iter_mut() {
+                for v in r.iter_mut() {
+                    *v = 0;
+                }
+            }
+        }
 
         let max_depth = limits.depth.unwrap_or(64).clamp(1, 64) as usize;
         let multi = limits.multi_pv.max(1) as usize;
@@ -237,8 +284,13 @@ impl Searcher {
         // deepest allowed ply.
         let mut moves_pool = Box::new([MoveList::new(); MAX_PLY + 1]);
 
+        // Lazy SMP: start from a different depth for each thread to explore
+        // different parts of the tree. The offset wraps around so threads
+        // with offset 0, 1, 2 search depths starting at 1, 2, 3.
+        let start_depth = (1 + self.depth_offset).max(1) as usize;
+
         let mut prev = 0i32;
-        for d in 1..=max_depth {
+        for d in start_depth..=max_depth {
             // Aspiration windows from depth 6 on: search around the previous
             // iteration's score. On a fail, re-center the window on the fail
             // score and widen (never fall back to a full window), so the
@@ -306,7 +358,7 @@ impl Searcher {
 
     fn root_search(&mut self, pos: &mut Position, depth: i32, alpha: i32, beta: i32, stop: &AtomicBool, eval: EvalFn, pool: &mut [MoveList]) -> RootResult {
         let mut moves = generate_legal(pos);
-        let tt_move = if self.use_tt { self.tt.probe(pos.key).map(|e| e.mv_move()) } else { None };
+        let tt_move = if self.use_tt { self.tt.probe(pos.key).map(|(_, mv, _, _)| mv) } else { None };
         self.order_moves(pos, &mut moves, tt_move, 0);
 
         if moves.len == 0 {
@@ -460,27 +512,35 @@ impl Searcher {
 
         let key = pos.key;
         let tt_move = match if self.use_tt { self.tt.probe(key) } else { None } {
-            Some(e) => {
-                if ply > 0 && e.depth() >= depth {
-                    match e.flag() {
-                        FLAG_EXACT => return Self::score_from_tt(e.score, ply),
+            Some((tt_score, tt_mv, tt_flag, tt_depth)) => {
+                if ply > 0 && tt_depth >= depth {
+                    match tt_flag {
+                        FLAG_EXACT => return Self::score_from_tt(tt_score, ply),
                         FLAG_LOWER => {
-                            if e.score >= beta {
-                                return Self::score_from_tt(e.score, ply);
+                            if tt_score >= beta {
+                                return Self::score_from_tt(tt_score, ply);
                             }
                         }
                         FLAG_UPPER => {
-                            if e.score <= alpha {
-                                return Self::score_from_tt(e.score, ply);
+                            if tt_score <= alpha {
+                                return Self::score_from_tt(tt_score, ply);
                             }
                         }
                         _ => {}
                     }
                 }
-                Some(e.mv_move())
+                Some(tt_mv)
             }
             None => None,
         };
+
+        // Internal iterative reduction: without a TT move and sufficient depth,
+        // reduce by 1 to avoid a full-window search on a mostly uninformative
+        // node (Stockfish IIR, depth >= 4).
+        let mut iir_depth = depth;
+        if self.use_tt && tt_move.is_none() && depth >= 4 && !in_check {
+            iir_depth -= 1;
+        }
 
         let occ_count = pos.occ.count_ones();
         let mut eval_cache = 0i32;
@@ -508,9 +568,52 @@ impl Searcher {
             }
         }
 
+        // Razoring: at low depth, if eval is far below alpha, the position is
+        // likely losing. Drop into quiescence to confirm (Stockfish razoring).
+        if depth <= 1 && !in_check && ply > 0 {
+            if !have_eval {
+                eval_cache = eval(pos);
+            }
+            if eval_cache + 300 < alpha {
+                let razor = self.quiescence(pos, alpha, beta, ply, stop, eval, pool);
+                return razor.max(eval_cache);
+            }
+        }
+
         let us = pos.side;
         let pinned = pos.pinned();
         let king = pos.king_sq[us];
+
+        // Singular extensions: if the TT move is the only move that can exceed
+        // alpha (all others fail low), extend the search by 1 ply.
+        let mut se_ext = 0i32;
+        if let Some(tt_m) = tt_move {
+            if depth >= 5 && self.use_tt {
+                let margin = 2 * depth as i32;
+                let se_depth = (depth / 2).max(1);
+                if !have_eval {
+                    eval_cache = eval(pos);
+                }
+                let mut se_best = eval_cache;
+                let verify = in_check
+                    || tt_m.is_en_passant()
+                    || tt_m.from() == king
+                    || (pinned & bit(tt_m.from()) != 0);
+                let undo = pos.make_move(tt_m);
+                if verify && !pos.king_safe(us) {
+                    pos.unmake_move(undo);
+                } else {
+                    self.key_hist[self.key_hist_len] = pos.key;
+                    self.key_hist_len += 1;
+                    se_best = -self.negamax(pos, se_depth, -(alpha + margin), -(alpha + margin - 1), ply + 1, stop, eval, pool);
+                    self.key_hist_len -= 1;
+                    pos.unmake_move(undo);
+                }
+                if se_best <= alpha + margin - 1 {
+                    se_ext = 1;
+                }
+            }
+        }
 
         let mut best = -INF;
         let mut best_move = Move::null();
@@ -539,7 +642,7 @@ let mut searched: Option<Move> = None;
             } else {
                 self.key_hist[self.key_hist_len] = pos.key;
             self.key_hist_len += 1;
-                let s = -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval, pool);
+                let s = -self.negamax(pos, depth - 1 + se_ext, -beta, -alpha0, ply + 1, stop, eval, pool);
                 self.key_hist_len -= 1;
                 pos.unmake_move(undo);
                 if stop.load(Ordering::Relaxed) {
@@ -572,7 +675,7 @@ let mut searched: Option<Move> = None;
                 }
                 searched = Some(tt_m);
             }
-            }
+        }
         }
 
         let (moves, rest) = pool.split_first_mut().expect("move pool exhausted");
@@ -583,7 +686,7 @@ let mut searched: Option<Move> = None;
             return if in_check { -MATE + ply as i32 } else { 0 };
         }
 
-        order_moves_impl(pos, &self.killers, &self.history, &mut self.scratch, moves, tt_move, ply);
+        order_moves_impl(pos, &self.killers, &self.history, &self.cap_history, &mut self.scratch, moves, tt_move, ply);
         #[cfg(feature = "profiling")]
         PROF.order.fetch_add(1, Ordering::Relaxed);
 
@@ -596,15 +699,9 @@ let mut searched: Option<Move> = None;
             // Reduction index: the skipped TT move occupied list slot 0, so
             // restore the original numbering for LMR thresholds.
             let idx = i + if searched.is_some() { 1 } else { 0 };
-            // Late Move Reductions: cut depth for quiet moves searched late.
-            let reduction = if idx > 0 && m.is_quiet() && !in_check && depth >= 3 {
-                if idx >= 6 {
-                    2
-                } else if idx >= 3 {
-                    1
-                } else {
-                    0
-                }
+            // Late Move Reductions: log-based table, same as Stockfish.
+            let reduction = if idx > 0 && m.is_quiet() && !in_check && iir_depth >= 3 {
+                LMR[iir_depth.min(63) as usize][idx.min(63) as usize]
             } else {
                 0
             };
@@ -621,12 +718,12 @@ let mut searched: Option<Move> = None;
             // Skipped near mate, when in check, or for the TT/killer moves
             // that are already searched before the loop. Runs before the
             // make_move below: pruned moves never touch the board.
-            if !in_check && m.is_quiet() && depth <= 3 && alpha0 > -MATE + MAX_PLY as i32 {
+            if !in_check && m.is_quiet() && iir_depth <= 3 && alpha0 > -MATE + MAX_PLY as i32 {
                 if !have_eval {
                     eval_cache = eval(pos);
                     have_eval = true;
                 }
-                if eval_cache + 110 * depth <= alpha0 || idx >= (5 + depth * depth) as usize {
+                if eval_cache + 110 * iir_depth <= alpha0 || idx >= (5 + iir_depth * iir_depth) as usize {
                     pruned = true;
                     continue;
                 }
@@ -641,11 +738,11 @@ let mut searched: Option<Move> = None;
             self.key_hist[self.key_hist_len] = pos.key;
             self.key_hist_len += 1;
             let s = if i == 0 && searched.is_none() {
-                -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval, rest)
+                -self.negamax(pos, iir_depth - 1, -beta, -alpha0, ply + 1, stop, eval, rest)
             } else {
                 let s = -self.negamax(
                     pos,
-                    depth - 1 - reduction,
+                    iir_depth - 1 - reduction,
                     -alpha0 - 1,
                     -alpha0,
                     ply + 1,
@@ -654,7 +751,7 @@ let mut searched: Option<Move> = None;
                     rest,
                 );
                 if s > alpha0 && s < beta {
-                    -self.negamax(pos, depth - 1, -beta, -alpha0, ply + 1, stop, eval, rest)
+                    -self.negamax(pos, iir_depth - 1, -beta, -alpha0, ply + 1, stop, eval, rest)
                 } else {
                     s
                 }
@@ -678,10 +775,21 @@ let mut searched: Option<Move> = None;
             }
             if alpha0 >= beta {
                 if best_move.is_quiet() {
-                    self.update_history(pos, best_move, depth);
+                    self.update_history(pos, best_move, iir_depth);
                     if self.killers[ply][0] != best_move {
                         self.killers[ply][1] = self.killers[ply][0];
                         self.killers[ply][0] = best_move;
+                    }
+                    self.update_cap_history(pos, best_move, iir_depth);
+                } else if best_move.is_capture() {
+                    let ch = &mut self.cap_history[us][best_move.from()][best_move.to()];
+                    *ch += iir_depth * iir_depth;
+                    if *ch > 16_000 {
+                        for r in self.cap_history[us].iter_mut() {
+                            for v in r.iter_mut() {
+                                *v /= 2;
+                            }
+                        }
                     }
                 }
                 break;
@@ -812,7 +920,7 @@ let mut searched: Option<Move> = None;
     }
 
     pub fn order_moves(&mut self, pos: &Position, moves: &mut MoveList, tt_move: Option<Move>, ply: usize) {
-        order_moves_impl(pos, &self.killers, &self.history, &mut self.scratch, moves, tt_move, ply);
+        order_moves_impl(pos, &self.killers, &self.history, &self.cap_history, &mut self.scratch, moves, tt_move, ply);
     }
 
     fn update_history(&mut self, pos: &Position, m: Move, depth: i32) {
@@ -820,6 +928,18 @@ let mut searched: Option<Move> = None;
         *h += depth * depth;
         if *h > 16_000 {
             for r in self.history[pos.side].iter_mut() {
+                for v in r.iter_mut() {
+                    *v /= 2;
+                }
+            }
+        }
+    }
+
+    fn update_cap_history(&mut self, pos: &Position, m: Move, depth: i32) {
+        let h = &mut self.cap_history[pos.side][m.from()][m.to()];
+        *h += depth * depth;
+        if *h > 16_000 {
+            for r in self.cap_history[pos.side].iter_mut() {
                 for v in r.iter_mut() {
                     *v /= 2;
                 }
@@ -882,13 +1002,12 @@ fn compute_budget(pos: &Position, limits: &Limits) -> Duration {
 }
 
 /// Scores and insertion-sorts `moves` by descending priority: TT move first,
-/// then MVV-LVA captures/promotions, killers, history. `scratch` holds the
-/// per-call scores and is passed in so the caller can hold `moves` and
-/// `scratch` as disjoint borrows of the same `Searcher`.
+/// then MVV-LVA captures/promotions, killers, history, capture history.
 fn order_moves_impl(
     pos: &Position,
     killers: &[[Move; 2]; MAX_PLY],
     history: &[[[i32; 64]; 64]; 2],
+    cap_history: &[[[i32; 64]; 64]; 2],
     scratch: &mut [i32],
     moves: &mut MoveList,
     tt_move: Option<Move>,
@@ -915,6 +1034,7 @@ fn order_moves_impl(
                     pos.piece_pt_at(m.from())
                 };
                 s += 500_000 + PIECE_ORDER[victim] * 16 - PIECE_ORDER[attacker];
+                s += cap_history[pos.side][m.from()][m.to()];
             }
             if killers[ply][0] == m {
                 s += 300_000;

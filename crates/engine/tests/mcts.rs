@@ -146,14 +146,14 @@ fn incremental_search_reuses_subtree() {
     let mut pos = Position::startpos();
     let stop = Arc::new(AtomicBool::new(false));
 
-    let r1 = search.search(&pos, 4000, pesto_combined, stop.clone());
+    let r1 = search.search(&pos, 4000, pesto_combined, stop.clone(), false, 0.0);
     assert!(!r1.visits.is_empty());
     let mv = r1.best;
 
     search.keep_child(mv);
     pos.make_move(mv);
 
-    let r2 = search.search(&pos, 4000, pesto_combined, stop.clone());
+    let r2 = search.search(&pos, 4000, pesto_combined, stop.clone(), false, 0.0);
     // The new root's children keep the visits accumulated under the old root
     // (through `mv`) plus the fresh playouts: strictly more than the budget.
     let sum2: u32 = r2.visits.iter().map(|(_, v)| v).sum();
@@ -171,10 +171,10 @@ fn incremental_search_reset_gives_fresh_tree() {
     let mut pos = Position::startpos();
     let stop = Arc::new(AtomicBool::new(false));
 
-    let r1 = search.search(&pos, 1000, pesto_combined, stop.clone());
+    let r1 = search.search(&pos, 1000, pesto_combined, stop.clone(), false, 0.0);
     search.reset();
     pos = Position::startpos();
-    let r2 = search.search(&pos, 1000, pesto_combined, stop.clone());
+    let r2 = search.search(&pos, 1000, pesto_combined, stop.clone(), false, 0.0);
     let sum2: u32 = r2.visits.iter().map(|(_, v)| v).sum();
     // Small overcount is possible when two workers pass the budget check at
     // once; a reset tree must start from (near) zero retained visits.

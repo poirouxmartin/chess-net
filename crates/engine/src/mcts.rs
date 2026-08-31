@@ -21,6 +21,75 @@ use crate::movegen::{generate_legal, MoveList, MAX_MOVES};
 use crate::position::Position;
 use crate::search::EvalFn;
 
+/// Alpha, epsilon for Dirichlet noise at root (AlphaZero defaults).
+pub const DIRICHLET_ALPHA: f32 = 0.03;
+pub const DIRICHLET_EPSILON: f32 = 0.25;
+
+/// Sample Gamma(shape, 1.0) using Marsaglia-Tsang method.
+/// Valid for shape >= 1 (we use shape = 1 for Dirichlet).
+fn sample_gamma(shape: f32, rng: &mut u64) -> f32 {
+    let d = shape - 1.0 / 3.0;
+    loop {
+        let mut x;
+        loop {
+            x = sample_normal(rng);
+            if x > -1.0 / (3.0 * shape).sqrt() {
+                break;
+            }
+        }
+        let v = 1.0 + x / (3.0 * shape).sqrt();
+        let v3 = v * v * v;
+        let u = sample_uniform(rng);
+        if u < 1.0 - 0.0331 * x * x * x * x {
+            return d * v3;
+        }
+        if (u.ln()) < 0.5 * x * x + d * (1.0 - v3 + v3.ln()) {
+            return d * v3;
+        }
+    }
+}
+
+/// Sample Gamma(alpha, 1) for alpha < 1 using the alpha-exp trick:
+/// Gamma(a) = Gamma(a+1) * U^(1/a).
+fn sample_gamma_small(alpha: f32, rng: &mut u64) -> f32 {
+    let big = sample_gamma(alpha + 1.0, rng);
+    let u = sample_uniform(rng);
+    big * u.powf(1.0 / alpha)
+}
+
+/// Box-Muller normal(0,1).
+fn sample_normal(rng: &mut u64) -> f32 {
+    let u1 = sample_uniform(rng).max(1e-10);
+    let u2 = sample_uniform(rng);
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+}
+
+/// Simple xorshift64 PRNG.
+#[inline]
+fn sample_uniform(rng: &mut u64) -> f32 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    (*rng as f32) / (u64::MAX as f32)
+}
+
+/// Sample Dirichlet(alpha) distribution, returning `n` probabilities summing to 1.
+fn sample_dirichlet(n: usize, alpha: f32, rng: &mut u64) -> Vec<f32> {
+    let mut samples: Vec<f32> = (0..n).map(|_| {
+        if alpha < 1.0 {
+            sample_gamma_small(alpha, rng)
+        } else {
+            sample_gamma(alpha, rng)
+        }
+    }).collect();
+    let sum: f32 = samples.iter().sum();
+    let inv = 1.0 / sum.max(f32::EPSILON);
+    for s in samples.iter_mut() {
+        *s *= inv;
+    }
+    samples
+}
+
 /// Value function: centipawns from the side-to-move perspective (same contract
 /// as the alpha-beta `EvalFn`).
 pub type ValueFn = EvalFn;
@@ -307,12 +376,21 @@ fn eval_value(eval_fn: ValuePolicyFn, pos: &Position) -> f32 {
 
 /// Creates the root's children (single-threaded, before any worker starts).
 /// `root` is the node whose children are created (ROOT_ID for a fresh tree, or
-/// a reused subtree root).
-fn expand_root(tree: &Tree, root: u32, pos: &Position, eval_fn: ValuePolicyFn) {
+/// a reused subtree root). When `dirichlet` is true, adds Dirichlet noise to
+/// the priors for exploration (AlphaZero-style).
+fn expand_root(tree: &Tree, root: u32, pos: &Position, eval_fn: ValuePolicyFn, dirichlet: bool) {
     let legal = generate_legal(pos);
     let (_, logits) = eval_fn(pos, &legal);
     let mut priors = [0f32; MAX_MOVES];
     softmax_priors(&logits, legal.len, &mut priors);
+    if dirichlet && legal.len > 0 {
+        let mut rng = 0xCAFEBABE_DEAD_BEEFu64;
+        let noise = sample_dirichlet(legal.len, DIRICHLET_ALPHA, &mut rng);
+        let eps = DIRICHLET_EPSILON;
+        for i in 0..legal.len {
+            priors[i] = (1.0 - eps) * priors[i] + eps * noise[i];
+        }
+    }
     let mut first = NO_ID;
     let mut count = 0u32;
     for (i, &mv) in legal.moves[..legal.len].iter().enumerate() {
@@ -489,7 +567,7 @@ return MctsResult {
             time_ms: start.elapsed().as_millis() as u64,
         };
     }
-    expand_root(&tree, ROOT_ID, pos, eval_fn);
+    expand_root(&tree, ROOT_ID, pos, eval_fn, false);
 
     let mut playouts = 0u64;
     let mut last_report = start;
@@ -590,7 +668,7 @@ let mut trees: Vec<Arc<Tree>> = Vec::with_capacity(threads);
     let mut handles = Vec::with_capacity(threads);
     for _ in 0..threads {
         let tree = Arc::new(Tree::new(per_thread_cap(limits, threads)));
-        expand_root(&tree, ROOT_ID, &root_pos, eval_fn);
+        expand_root(&tree, ROOT_ID, &root_pos, eval_fn, false);
         trees.push(tree.clone());
         let stop = stop.clone();
 let counter = counter.clone();
@@ -733,12 +811,17 @@ impl MctsSearch {
 
     /// Runs up to `playouts` playouts (or until `stop`) from the current root,
     /// which must correspond to `pos`. Terminal positions return immediately.
+    /// When `dirichlet` is true, adds Dirichlet noise to root priors.
+    /// `temperature` controls move selection: 0 = pick most visited,
+    /// >0 = sample proportional to visits^(1/temp).
     pub fn search(
         &mut self,
         pos: &Position,
         playouts: u64,
         eval_fn: ValuePolicyFn,
         stop: Arc<AtomicBool>,
+        dirichlet: bool,
+        temperature: f32,
     ) -> MctsResult {
         let start = Instant::now();
         let legal = generate_legal(pos);
@@ -764,7 +847,7 @@ impl MctsSearch {
 
         // Make sure the root's children exist for this position.
         if self.tree.node(self.root).n_children.load(Ordering::Acquire) == 0 {
-            expand_root(&self.tree, self.root, pos, eval_fn);
+            expand_root(&self.tree, self.root, pos, eval_fn, dirichlet);
         }
 
         let tree = self.tree.clone();
@@ -789,7 +872,11 @@ impl MctsSearch {
             let _ = h.join();
         }
 
-        let best_id = tree.best_child(root);
+        let best_id = if temperature > 0.0 {
+            self.select_with_temperature(&tree, self.root, temperature)
+        } else {
+            tree.best_child(root)
+        };
         let best = tree.node(best_id).mv();
         let value = q_to_prob(tree.node(best_id).q());
         MctsResult {
@@ -819,6 +906,36 @@ impl MctsSearch {
         }
         self.reset();
     }
+
+    /// Select a child of `node` proportional to visits^(1/temperature).
+    /// temperature > 0; lower temperature = more greedy.
+    fn select_with_temperature(&self, tree: &Tree, node: u32, temperature: f32) -> u32 {
+        let inv_temp = 1.0 / temperature;
+        let mut total = 0.0f32;
+        let mut c = tree.node(node).first_child.load(Ordering::Relaxed);
+        while c != NO_ID {
+            let v = tree.node(c).visits() as f32;
+            total += v.powf(inv_temp);
+            c = tree.node(c).next_sibling.load(Ordering::Relaxed);
+        }
+        if total <= 0.0 {
+            return tree.best_child(node);
+        }
+        let mut rng = 0xDEAD_BEEF_CAFEBABEu64;
+        let mut r = sample_uniform(&mut rng) * total;
+        let mut c = tree.node(node).first_child.load(Ordering::Relaxed);
+        let mut prev = c;
+        while c != NO_ID {
+            let v = tree.node(c).visits() as f32;
+            r -= v.powf(inv_temp);
+            if r <= 0.0 {
+                return c;
+            }
+            prev = c;
+            c = tree.node(c).next_sibling.load(Ordering::Relaxed);
+        }
+        prev
+    }
 }
 
 #[cfg(test)]
@@ -837,11 +954,11 @@ mod tests {
         let mut s = MctsSearch::new(1 << 20, 1);
         let stop = Arc::new(AtomicBool::new(false));
         let mut pos = Position::startpos();
-        let r1 = s.search(&pos, 4000, cb, stop.clone());
+        let r1 = s.search(&pos, 4000, cb, stop.clone(), false, 0.0);
         let mv = r1.best;
         s.keep_child(mv);
         pos.make_move(mv);
-        let r2 = s.search(&pos, 4000, cb, stop.clone());
+        let r2 = s.search(&pos, 4000, cb, stop.clone(), false, 0.0);
         let sum2: u32 = r2.visits.iter().map(|(_, v)| v).sum();
         assert!(sum2 > 4000, "kept subtree visits must carry over, got {sum2}");
         assert_eq!(s.rebuilds(), 0);
@@ -854,7 +971,7 @@ mod tests {
         let mut s = MctsSearch::new(65536, 1);
         let stop = Arc::new(AtomicBool::new(false));
         let pos = Position::startpos();
-        s.search(&pos, 4000, cb, stop.clone());
+        s.search(&pos, 4000, cb, stop.clone(), false, 0.0);
         let root = s.tree.node(ROOT_ID);
         let mut total_grand_visits = 0u32;
         let mut c = root.first_child.load(Ordering::Relaxed);

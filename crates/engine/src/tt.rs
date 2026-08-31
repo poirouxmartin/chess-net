@@ -3,7 +3,7 @@
 //! (offset by 128) and bound flag are packed into the free high bits of `mv`
 //! (a Move only uses bits 0..21), so a probe touches a single cache line.
 
-use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::move_::Move;
 
@@ -16,78 +16,73 @@ const DEPTH_SHIFT: u32 = 21;
 /// Bits 29..32 of `mv`: bound flag.
 const FLAG_SHIFT: u32 = 29;
 
-#[derive(Clone, Copy)]
-pub struct TTEntry {
-    pub key: u64,
-    pub score: i32,
-    /// Move (bits 0..21) plus packed depth and flag (bits 21..32).
-    pub mv: u32,
+/// A single TT entry packed into 16 bytes for lock-free concurrent access.
+/// key (64 bit) is stored separately; the mv field packs move + depth + flag.
+struct PackedEntry {
+    key: AtomicU64,
+    mv: AtomicU64,
 }
 
-impl TTEntry {
+impl PackedEntry {
     fn empty() -> Self {
-        TTEntry { key: 0, score: 0, mv: 0 }
-    }
-
-    #[inline(always)]
-    pub fn depth(&self) -> i32 {
-        ((self.mv >> DEPTH_SHIFT) & 0xFF) as i32 - 128
-    }
-
-    #[inline(always)]
-    pub fn flag(&self) -> u8 {
-        ((self.mv >> FLAG_SHIFT) & 0x07) as u8
-    }
-
-    #[inline(always)]
-    pub fn mv_move(&self) -> Move {
-        Move(self.mv & MOVE_MASK)
+        PackedEntry { key: AtomicU64::new(0), mv: AtomicU64::new(0) }
     }
 }
-
-/// Bits 0..21 of `mv` hold the actual move.
-const MOVE_MASK: u32 = (1 << 21) - 1;
 
 pub struct TT {
-    entries: Box<[TTEntry]>,
+    entries: Box<[PackedEntry]>,
     mask: usize,
 }
 
 impl TT {
     pub fn new(size_mb: usize) -> Self {
-        let n = (size_mb * 1024 * 1024) / size_of::<TTEntry>();
+        let n = (size_mb * 1024 * 1024) / 16; // 16 bytes per entry
         let n = n.max(1) as u64;
         let mask = (1u64 << (64 - n.leading_zeros() - 1)).max(1) - 1;
         Self {
-            entries: vec![TTEntry::empty(); mask as usize + 1].into_boxed_slice(),
+            entries: (0..=mask).map(|_| PackedEntry::empty()).collect::<Vec<_>>().into_boxed_slice(),
             mask: mask as usize,
         }
     }
 
     #[inline]
-    pub fn probe(&self, key: u64) -> Option<&TTEntry> {
-        let e = &self.entries[(key as usize) & self.mask];
-        if e.key == key {
-            Some(e)
+    pub fn probe(&self, key: u64) -> Option<(i32, Move, u8, i32)> {
+        let idx = (key as usize) & self.mask;
+        let e = &self.entries[idx];
+        let k = e.key.load(Ordering::Relaxed);
+        if k == key {
+            let mv = e.mv.load(Ordering::Relaxed);
+            let score = (mv >> 32) as i32;
+            let raw_mv = (mv & 0x1F_FFFF) as u32;
+            let depth = ((mv >> 21) & 0xFF) as i32 - 128;
+            let flag = ((mv >> 29) & 0x07) as u8;
+            Some((score, Move(raw_mv), flag, depth))
         } else {
             None
         }
     }
 
     #[inline]
-    pub fn store(&mut self, key: u64, score: i32, depth: i32, flag: u8, mv: Move) {
+    pub fn store(&self, key: u64, score: i32, depth: i32, flag: u8, mv: Move) {
         let idx = (key as usize) & self.mask;
-        let e = &mut self.entries[idx];
-        if e.key == key || depth > e.depth() || e.depth() < 0 {
-            e.key = key;
-            e.score = score;
-            e.mv = mv.0 | (((depth + 128) as u32) << DEPTH_SHIFT) | ((flag as u32) << FLAG_SHIFT);
+        let e = &self.entries[idx];
+        let old_mv = e.mv.load(Ordering::Relaxed);
+        let old_depth = ((old_mv >> 21) & 0xFF) as i32 - 128;
+        let new_mv = (mv.0 as u64)
+            | (((depth + 128) as u64) << 21)
+            | ((flag as u64) << 29)
+            | ((score as u32 as u64) << 32);
+        // Always replace on key match, deeper entry, or empty slot.
+        if e.key.load(Ordering::Relaxed) == key || depth > old_depth || old_depth < 0 {
+            e.key.store(key, Ordering::Relaxed);
+            e.mv.store(new_mv, Ordering::Relaxed);
         }
     }
 
-    pub fn clear(&mut self) {
-        for e in self.entries.iter_mut() {
-            *e = TTEntry::empty();
+    pub fn clear(&self) {
+        for e in self.entries.iter() {
+            e.key.store(0, Ordering::Relaxed);
+            e.mv.store(0, Ordering::Relaxed);
         }
     }
 }
