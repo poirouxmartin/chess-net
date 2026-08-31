@@ -109,6 +109,9 @@ pub struct Searcher {
     history: [[[i32; 64]; 64]; 2],
     /// Capture history: indexed by [side][from][to].
     cap_history: [[[i32; 64]; 64]; 2],
+    /// Countermove heuristic: indexed by [side][piece_type][to_square].
+    /// Updated on quiet beta cutoffs, used in move ordering.
+    countermove: [[[Move; 64]; 6]; 2],
     pv_table: Box<[[Move; MAX_PLY]; MAX_PLY]>,
     pv_len: [usize; MAX_PLY],
     nodes: u64,
@@ -202,6 +205,7 @@ impl Searcher {
             killers: [[Move::null(); 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             cap_history: [[[0; 64]; 64]; 2],
+            countermove: [[[Move::null(); 64]; 6]; 2],
             pv_table: Box::new([[Move::null(); MAX_PLY]; MAX_PLY]),
             pv_len: [0; MAX_PLY],
             nodes: 0,
@@ -222,6 +226,7 @@ impl Searcher {
             killers: [[Move::null(); 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
             cap_history: [[[0; 64]; 64]; 2],
+            countermove: [[[Move::null(); 64]; 6]; 2],
             pv_table: Box::new([[Move::null(); MAX_PLY]; MAX_PLY]),
             pv_len: [0; MAX_PLY],
             nodes: 0,
@@ -267,6 +272,13 @@ impl Searcher {
             for r in ch.iter_mut() {
                 for v in r.iter_mut() {
                     *v = 0;
+                }
+            }
+        }
+        for cm in self.countermove.iter_mut() {
+            for r in cm.iter_mut() {
+                for v in r.iter_mut() {
+                    *v = Move::null();
                 }
             }
         }
@@ -585,16 +597,18 @@ impl Searcher {
         let king = pos.king_sq[us];
 
         // Singular extensions: if the TT move is the only move that can exceed
-        // alpha (all others fail low), extend the search by 1 ply.
+        // alpha (all others fail low), extend the search by 1 ply.  Only fires
+        // at depth >= 8: the null-window verification search is expensive and
+        // the benefit at shallow depths is marginal.
         let mut se_ext = 0i32;
         if let Some(tt_m) = tt_move {
-            if depth >= 5 && self.use_tt {
+            if depth >= 8 && self.use_tt {
                 let margin = 2 * depth as i32;
                 let se_depth = (depth / 2).max(1);
                 if !have_eval {
                     eval_cache = eval(pos);
                 }
-                let mut se_best = eval_cache;
+                let mut se_best = -INF;
                 let verify = in_check
                     || tt_m.is_en_passant()
                     || tt_m.from() == king
