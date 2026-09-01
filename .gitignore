@@ -18,3 +18,8 @@ venv/
 .idea/
 .vscode/
 *.swp
+
+# Environment variables
+.env
+.env.local
+.env.*.local
