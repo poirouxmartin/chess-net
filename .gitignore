@@ -23,3 +23,10 @@ venv/
 .env
 .env.local
 .env.*.local
+# Training runs: checkpoints, teacher nets, logs
+/checkpoints*/
+/teacher/
+*.log
+*.pid
+*.onnx
+/showcase_*.ini
