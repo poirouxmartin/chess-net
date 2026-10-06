@@ -14,8 +14,10 @@ Project page: [martinpoiroux.com/en/projects/chess-net](https://martinpoiroux.co
 
 - Classical engine: done and verified (perft suite green, make/unmake round-trip, PVS search,
   Lazy SMP).
-- Neural evaluation: format, Rust inference and both Python training paths (supervised NNUE and
-  AlphaZero-style self-play) are written; a few training cycles have run.
+- Neural evaluation: CSNN format with Rust inference, and an ONNX Runtime GPU path for a
+  ResNet value/policy network driving a batched, multi-threaded MCTS.
+- Training (`python/chessnet/`): supervised NNUE, AlphaZero-style self-play (synchronous and
+  asynchronous actors/learner), and distillation from an lc0 teacher network.
 - Not done yet: the match against opti_chess that would make the comparison conclusive.
 
 ## Structure
