@@ -8,7 +8,7 @@ The counterpart of [opti_chess](https://github.com/poirouxmartin/opti_chess), wh
 written by hand: here the evaluation is learned. The goal is two independent answers to the same
 problem, not a stronger engine.
 
-Project page: [martinpoiroux.com/en/projects/chess-net](https://martinpoiroux.com/en/projects/chess-net/)
+Project page: [martinpoiroux.com/projets/chess-net/](https://martinpoiroux.com/projets/chess-net/)
 
 ## Status
 
