@@ -20,8 +20,11 @@ def main():
 
     state = torch.load(args.checkpoint, map_location="cpu")
     l0 = state["fb"].numel()
-    l1 = state["wo.weight"].shape[0]
+    l1 = state["wo.weight"].shape[1]
     feat_count = state["fw"].shape[0]
+    if args.feat_count is not None and args.feat_count != feat_count:
+        raise SystemExit(
+            f"--feat-count {args.feat_count} mismatches checkpoint ({feat_count})")
     model = NNUE(feat_count, l0, l1)
     model.load_state_dict(state)
     save_csnn(model, args.out, feat=args.feat)

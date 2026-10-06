@@ -64,7 +64,7 @@ def gen_net(checkpoint, games, mcts_iters, workers, out):
     trainer.net.load_state_dict(sd)
     data = trainer.self_play(games, mcts_iters, mcts_workers=workers)
     with open(out, "w") as f:
-        for fen, label in data:
+        for fen, _visits, label in data:
             f.write(f"{fen} {label}\n")
     print(f"{len(data)} positions -> {out}")
 
