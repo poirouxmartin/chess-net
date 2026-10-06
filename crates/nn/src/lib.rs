@@ -6,11 +6,16 @@
 //! Supported architectures:
 //!   feat=1  HalfKP (NNUE-style): 2 * 41024 sparse one-hot features
 //!   feat=2  KP768:               768 sparse one-hot features
+//!   feat=3  ResNet+SE (ONNX):    112 planes × 8×8, CUDA GPU inference
 //! Both are 3-layer MLPs: sparse L0 (l0) -> ReLU -> L1 (l1) -> ReLU -> logit.
 //! CSNN v1 is value-only; v2 adds a policy head sharing h1: one logit per
-//! from*64+to move (4096) that the MCTS can use as move priors.
+//! policy slot (4288: from*64+to STM-oriented + underpromo slices) that the
+//! MCTS can use as move priors.
 
-use std::sync::OnceLock;
+pub mod features_lc0;
+pub mod onnx;
+
+use std::sync::RwLock;
 
 use engine::movegen::MoveList;
 use engine::position::{Position, PAWN, BISHOP, KNIGHT, QUEEN, ROOK};
@@ -22,9 +27,37 @@ const HALFKP_PER_KING: usize = 641;
 const MAX_ACTIVE: usize = 96;
 const MAX_L0: usize = 1024;
 const MAX_POLICY: usize = 1 << 16;
-/// Policy output space the engine can consume: one logit per from*64+to move.
+/// Base policy space: one logit per from*64+to move on the side-to-move
+/// oriented board (mirrored ranks when black). Underpromotions (N/B/R)
+/// live in their own 64-slot slices past PROMO_BASE (queen shares base).
+/// Must match python/chessnet/resnet.py POLICY_SIZE.
 pub const POLICY_MOVES: usize = 4096;
+pub const PROMO_BASE: usize = 4096;
+pub const POLICY_SIZE: usize = 4096 + 3 * 64; // = 4288
 
+/// Move -> policy index, side-to-move oriented (matches Python
+/// policy_index). `side`: 0 = white to move, 1 = black.
+pub fn policy_index(side: usize, m: engine::move_::Move) -> usize {
+    use engine::move_::{PROMO_BISHOP, PROMO_KNIGHT, PROMO_ROOK};
+    let (mut f, mut t) = (m.from(), m.to());
+    if side == 1 {
+        f = crate::features_lc0::flip_square(f);
+        t = crate::features_lc0::flip_square(t);
+    }
+    let base = f * 64 + t;
+    if m.is_promotion() {
+        match m.promo() {
+            // Queen shares the base index; N/B/R have their own slices.
+            PROMO_KNIGHT => return PROMO_BASE + 0 * 64 + f,
+            PROMO_BISHOP => return PROMO_BASE + 1 * 64 + f,
+            PROMO_ROOK => return PROMO_BASE + 2 * 64 + f,
+            _ => return base,
+        }
+    }
+    base
+}
+
+#[derive(Clone)]
 pub struct Net {
     pub feat: u32,
     pub l0: usize,
@@ -42,28 +75,30 @@ pub struct Net {
     pub bp: Vec<f32>, // policy_size
 }
 
-static LOADED: OnceLock<Net> = OnceLock::new();
+static LOADED: RwLock<Option<Net>> = RwLock::new(None);
 
-/// Load a CSNN model file. Call once per EvalFile; panics if called twice.
+/// Load a CSNN model file, REPLACING any previously loaded net (EvalFile
+/// switches mid-session must take effect; the old OnceLock silently kept
+/// the first net forever).
 pub fn load(path: &str) -> Result<(), String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     let net = parse(&data)?;
-    let _ = LOADED.set(net);
+    *LOADED.write().unwrap_or_else(|e| e.into_inner()) = Some(net);
     Ok(())
 }
 
 pub fn is_loaded() -> bool {
-    LOADED.get().is_some()
+    LOADED.read().unwrap_or_else(|e| e.into_inner()).is_some() || onnx::OnnxEvaluator::is_ready()
 }
 
-/// The currently loaded net, if any.
-pub fn loaded() -> Option<&'static Net> {
-    LOADED.get()
+/// A clone of the currently loaded net, if any.
+pub fn loaded() -> Option<Net> {
+    LOADED.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Feature kind of the currently loaded net, if any.
 pub fn loaded_feat() -> Option<u32> {
-    LOADED.get().map(|n| n.feat)
+    LOADED.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|n| n.feat)
 }
 
 /// Write `net` to a CSNN file: version 1 (value only) when there is no policy
@@ -259,7 +294,8 @@ fn forward_h1(net: &Net, pos: &Position) -> [f32; MAX_L0] {
 /// is the white win prob/logit. The search needs side-to-move scores and must
 /// use [`evaluate_loaded_stm`] instead.
 pub fn evaluate_loaded(pos: &Position) -> i32 {
-    let net = LOADED.get().expect("no model loaded");
+    let guard = LOADED.read().unwrap_or_else(|e| e.into_inner());
+    let net = guard.as_ref().expect("no model loaded");
     let h1 = forward_h1(net, pos);
 
     let mut out = net.bo;
@@ -273,7 +309,8 @@ pub fn evaluate_loaded(pos: &Position) -> i32 {
 /// Both heads share the same hidden layer, so a single forward is used.
 /// `logits` has one entry per move in `legal` (empty when no policy head).
 pub fn evaluate_loaded_combined(pos: &Position, legal: &MoveList) -> (i32, Vec<f32>) {
-    let net = LOADED.get().expect("no model loaded");
+    let guard = LOADED.read().unwrap_or_else(|e| e.into_inner());
+    let net = guard.as_ref().expect("no model loaded");
     let h1 = forward_h1(net, pos);
 
     let mut out = net.bo;
@@ -283,22 +320,21 @@ pub fn evaluate_loaded_combined(pos: &Position, legal: &MoveList) -> (i32, Vec<f
     let cp = (out * 400.0).round() as i32;
     let cp = if pos.side == 0 { cp } else { -cp };
 
-    let logits = if net.policy_size == POLICY_MOVES {
-        policy_logits_from_h1(net, &h1, legal)
+    let logits = if net.policy_size == POLICY_SIZE {
+        policy_logits_from_h1(net, &h1, pos.side, legal)
     } else {
         Vec::new()
     };
     (cp, logits)
 }
 
-/// Policy logits for an explicit net and hidden layer (testable without the
-/// OnceLock). Empty when the net has no policy head.
-fn policy_logits_from_h1(net: &Net, h1: &[f32], legal: &MoveList) -> Vec<f32> {
+/// Policy logits for an explicit net and hidden layer (testable without a
+/// loaded model). Empty when the net has no policy head.
+fn policy_logits_from_h1(net: &Net, h1: &[f32], side: usize, legal: &MoveList) -> Vec<f32> {
     let mut out = Vec::with_capacity(legal.len);
     for i in 0..legal.len {
         let m = legal.get(i);
-        let idx = m.from() * 64 + m.to();
-        out.push(policy_logit(net, h1, idx));
+        out.push(policy_logit(net, h1, policy_index(side, m)));
     }
     out
 }
@@ -452,18 +488,18 @@ mod tests {
             b1: vec![0.0; l1],
             wo: vec![0.0; l1],
             bo: 0.0,
-            policy_size: POLICY_MOVES,
-            wp: vec![0.0; POLICY_MOVES * l1],
-            bp: vec![0.0; POLICY_MOVES],
+            policy_size: POLICY_SIZE,
+            wp: vec![0.0; POLICY_SIZE * l1],
+            bp: vec![0.0; POLICY_SIZE],
         };
         let pos = Position::startpos();
         let legal = engine::movegen::generate_legal(&pos);
-        let mut bp = vec![0.0; POLICY_MOVES];
+        let mut bp = vec![0.0; POLICY_SIZE];
         let m = legal.get(0);
-        bp[m.from() * 64 + m.to()] = 1.5;
+        bp[policy_index(pos.side, m)] = 1.5;
         let net = Net { bp, ..net };
         let h1 = forward_h1(&net, &pos);
-        let logits = policy_logits_from_h1(&net, &h1, &legal);
+        let logits = policy_logits_from_h1(&net, &h1, pos.side, &legal);
         assert_eq!(logits.len(), legal.len);
         assert!((logits[0] - 1.5).abs() < 1e-6);
         assert!(logits[1..].iter().all(|x| x.abs() < 1e-6));
@@ -472,7 +508,7 @@ mod tests {
     #[test]
     fn policy_logit_avx2_matches_scalar() {
         let l1 = 32usize;
-        let policy_size = POLICY_MOVES;
+        let policy_size = POLICY_SIZE;
         let wp: Vec<f32> = (0..policy_size * l1).map(|i| ((i as f32) * 0.37) % 1.0 - 0.5).collect();
         let bp: Vec<f32> = (0..policy_size).map(|i| ((i as f32) * 0.13) % 0.5).collect();
         let h1: Vec<f32> = (0..l1).map(|j| ((j as f32) * 0.7) % 1.0).collect();
@@ -509,7 +545,7 @@ mod tests {
         let l0 = 8usize;
         let l1 = 4usize;
         let feat_count = 768usize;
-        let policy_size = POLICY_MOVES;
+        let policy_size = POLICY_SIZE;
         let mut bp = vec![0.0f32; policy_size];
         let e2e4 = 12 * 64 + 28; // e2=12, e4=28
         bp[e2e4] = 5.0;
@@ -545,5 +581,20 @@ mod tests {
         );
         assert_eq!(result.best.to_uci(), "e2e4", "policy must steer MCTS to e2e4");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// policy_index mirrors the Python mapping: e2e4 (white) and e7e5
+    /// (black) share one index; underpromotions get their own slices.
+    #[test]
+    fn policy_index_mirrors_and_splits_promos() {
+        use engine::move_::{Move, FLAG_PROMO, PROMO_KNIGHT};
+        // e2=12, e4=28, e7=52, e5=36, e8=60.
+        assert_eq!(policy_index(0, Move::new(12, 28, 0, 0)), 12 * 64 + 28);
+        assert_eq!(policy_index(1, Move::new(52, 36, 0, 0)), 12 * 64 + 28);
+        assert_eq!(
+            policy_index(1, Move::new(52, 60, PROMO_KNIGHT, FLAG_PROMO)),
+            PROMO_BASE + 12
+        );
+        assert_eq!(POLICY_SIZE, 4288);
     }
 }

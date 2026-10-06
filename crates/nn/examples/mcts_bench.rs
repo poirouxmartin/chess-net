@@ -17,11 +17,12 @@ fn main() {
     let mut pos = engine::position::Position::startpos();
     let stop = Arc::new(AtomicBool::new(false));
     let start = Instant::now();
-    let res = mcts_parallel(
+    let (res, _search) = mcts_parallel(
         &mut pos,
         &MctsLimits { playouts: Some(playouts), movetime: None, threads },
         stop.clone(),
         nn::evaluate_loaded_combined,
+        None,
         None,
     );
     let dt = start.elapsed();

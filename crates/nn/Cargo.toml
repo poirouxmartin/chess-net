@@ -5,3 +5,7 @@ edition.workspace = true
 
 [dependencies]
 engine = { path = "../engine" }
+ort = { version = "2.0.0-rc.13", features = ["cuda", "std", "load-dynamic"], default-features = false }
+ndarray = "0.15"
+once_cell = "1"
+log = "0.4"
