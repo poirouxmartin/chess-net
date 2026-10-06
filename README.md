@@ -4,6 +4,20 @@ High-performance chess engine written in Rust with neural-network evaluation
 (two approaches: AlphaZero-style self-play RL and supervised NNUE), plus a
 Python training toolkit. UCI-compatible binary.
 
+The counterpart of [opti_chess](https://github.com/poirouxmartin/opti_chess), whose evaluation is
+written by hand: here the evaluation is learned. The goal is two independent answers to the same
+problem, not a stronger engine.
+
+Project page: [martinpoiroux.com/en/projects/chess-net](https://martinpoiroux.com/en/projects/chess-net/)
+
+## Status
+
+- Classical engine: done and verified (perft suite green, make/unmake round-trip, PVS search,
+  Lazy SMP).
+- Neural evaluation: format, Rust inference and both Python training paths (supervised NNUE and
+  AlphaZero-style self-play) are written; a few training cycles have run.
+- Not done yet: the match against opti_chess that would make the comparison conclusive.
+
 ## Structure
 
 ```
@@ -83,3 +97,7 @@ python -m chessnet.train_nnue --feat 1 --data data.txt --out model.pt --csnn net
 # Export an existing checkpoint
 python -m chessnet.export --checkpoint model.pt --out net.csnn
 ```
+
+## License
+
+MIT
