@@ -9,6 +9,7 @@ use crate::evaluate::{evaluate, MATE};
 use crate::movegen::generate_legal;
 use crate::move_::Move;
 use crate::position::Position;
+use crate::mcts::{MctsLimits, MctsProgress};
 use crate::search::{Limits, SearchResult, Searcher, EvalFn};
 use crate::tt::TT;
 
@@ -72,15 +73,20 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
                     }
                     i += 1;
                 }
-                i += 1;
-                let value = tokens[i..].join(" ");
+                // Skip the "value" separator if present; a bare `setoption`
+                // or `setoption name X` (button-type) has no value part and
+                // must not index out of bounds.
+                if i < tokens.len() && tokens[i] == "value" {
+                    i += 1;
+                }
+                let value = tokens.get(i..).map(|s| s.join(" ")).unwrap_or_default();
                 if name == "Hash" {
-                    if let Ok(v) = value.parse() {
-                        hash_mb = v;
+                    if let Ok(v) = value.parse::<usize>() {
+                        hash_mb = v.clamp(1, 4096);
                     }
                 } else if name == "Threads" {
                     if let Ok(v) = value.parse::<usize>() {
-                        threads = v.max(1);
+                        threads = v.clamp(1, 64);
                     }
                 } else if name == "EvalFile" {
                     if let Some(h) = hook {
@@ -91,6 +97,11 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
                 }
             }
             "position" => {
+                // A new position invalidates any running search: stop it
+                // first so no stale bestmove is ever printed afterwards.
+                stop.store(true, Ordering::Relaxed);
+                join(&mut search);
+                stop.store(false, Ordering::Relaxed);
                 pos = parse_position(&tokens[1..]);
             }
             "go" => {
@@ -99,6 +110,8 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
                 stop.store(false, Ordering::Relaxed);
                 let limits = parse_go(&tokens[1..]);
                 let eval = (*EVAL_FN.lock().unwrap()).unwrap_or(evaluate);
+                // Also update the MCTS eval to match
+                crate::mcts::set_mcts_eval(eval);
                 let hash = hash_mb;
                 let n_threads = threads;
                 let stop_clone = stop.clone();
@@ -113,6 +126,9 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
                 stop.store(false, Ordering::Relaxed);
             }
             "perft" => {
+                stop.store(true, Ordering::Relaxed);
+                join(&mut search);
+                stop.store(false, Ordering::Relaxed);
                 let depth: u32 = tokens.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
                 let threads: usize = tokens
                     .iter()
@@ -124,11 +140,17 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
                 out(&format!("nodes {}", n));
             }
             "divide" => {
+                stop.store(true, Ordering::Relaxed);
+                join(&mut search);
+                stop.store(false, Ordering::Relaxed);
                 let depth: u32 = tokens.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
                 let n = crate::perft::divide(&mut pos, depth);
                 out(&format!("nodes {}", n));
             }
             "moves" => {
+                stop.store(true, Ordering::Relaxed);
+                join(&mut search);
+                stop.store(false, Ordering::Relaxed);
                 let ml = generate_legal(&pos);
                 let s = ml
                     .iter()
@@ -138,9 +160,112 @@ pub fn run_with_hook(hook: Option<&dyn Fn(&str, &str) -> bool>) {
                 out(&s);
             }
             "d" => {
+                stop.store(true, Ordering::Relaxed);
+                join(&mut search);
+                stop.store(false, Ordering::Relaxed);
                 out(&pos.to_fen());
             }
+            "mcts" => {
+                stop.store(true, Ordering::Relaxed);
+                join(&mut search);
+                stop.store(false, Ordering::Relaxed);
+                // mcts [playouts N] [threads N] [temperature F] [batch N]
+                let playouts = tokens
+                    .iter()
+                    .position(|&t| t == "playouts")
+                    .and_then(|i| tokens.get(i + 1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(800u64);
+                let threads = tokens
+                    .iter()
+                    .position(|&t| t == "threads")
+                    .and_then(|i| tokens.get(i + 1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1usize);
+                let _temperature = tokens
+                    .iter()
+                    .position(|&t| t == "temperature")
+                    .and_then(|i| tokens.get(i + 1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.0f32);
+                let batch_size = tokens
+                    .iter()
+                    .position(|&t| t == "batch")
+                    .and_then(|i| tokens.get(i + 1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(32usize);
+                // Ensure the MCTS eval matches the current eval setting
+                let eval = (*EVAL_FN.lock().unwrap()).unwrap_or(evaluate);
+                crate::mcts::set_mcts_eval(eval);
+                let limits = MctsLimits {
+                    playouts: Some(playouts),
+                    movetime: None,
+                    threads,
+                };
+                // Share the GLOBAL stop flag (not a local one) so `stop` /
+                // `quit` interrupt this synchronous command, and the next
+                // `go` starts from a clean state.
+                let stop = stop.clone();
+                let mut pos_clone = pos.clone();
+                let mut on_progress = |p: &MctsProgress| {
+                    let pv: Vec<String> = p.moves.iter().map(|info| info.mv.to_uci()).collect();
+                    out(&format!(
+                        "info depth 1 score cp {} time {} nodes {} pv {}",
+                        crate::mcts::cp_from_prob(p.value),
+                        p.time_ms,
+                        p.playouts,
+                        pv.join(" ")
+                    ));
+                };
+                // Use batched MCTS when a batch eval function is available
+                let r = if let Some(batch_eval) = crate::mcts::get_batch_eval() {
+                    if threads > 1 {
+                        let (res, _search) = crate::mcts::mcts_batched_parallel(
+                            &mut pos_clone,
+                            &limits,
+                            &stop,
+                            crate::mcts::mcts_value_fn,
+                            batch_eval,
+                            batch_size,
+                            false,
+                            Some(&mut on_progress),
+                            None,
+                        );
+                        res
+                    } else {
+                        crate::mcts::mcts_batched(
+                            &mut pos_clone,
+                            &limits,
+                            &stop,
+                            crate::mcts::mcts_value_fn,
+                            batch_eval,
+                            batch_size,
+                            false,
+                            Some(&mut on_progress),
+                        )
+                    }
+                } else {
+                    crate::mcts::mcts_root(
+                        &mut pos_clone,
+                        &limits,
+                        &stop,
+                        crate::mcts::mcts_value_fn,
+                        Some(&mut on_progress),
+                    )
+                };
+                let _pv: Vec<String> = r.visits.iter().take(5).map(|(m, _)| m.to_uci()).collect();
+                // Terminal positions have no legal move: spec says 0000,
+                // never a pseudo-legal-looking square pair.
+                if r.best == Move::null() {
+                    out("bestmove 0000");
+                } else {
+                    out(&format!("bestmove {}", r.best.to_uci()));
+                }
+            }
             "eval" => {
+                stop.store(true, Ordering::Relaxed);
+                join(&mut search);
+                stop.store(false, Ordering::Relaxed);
                 let eval = (*EVAL_FN.lock().unwrap()).unwrap_or(evaluate);
                 out(&format!("eval {}", eval(&pos)));
             }
@@ -171,11 +296,20 @@ fn lazy_smp_search(
             let limits = limits.clone();
             let pos = pos.clone();
             let best = best.clone();
-            let offset = if t == 0 { 0 } else { (t as i32 & 1) | (((t as i32) >> 1) & 1) };
+            // Depth diversity across helper threads (0/1/2): threads that
+            // would otherwise skip the whole loop (start_depth > max_depth)
+            // return depth 0 and are ignored in the aggregation below.
+            let offset = (t as i32).min(2);
             thread::spawn(move || {
                 let mut pos = pos;
                 let mut s = Searcher::with_tt(tt, offset);
                 let r = s.think(&mut pos, &limits, &stop, eval);
+                // Skip threads that never completed an iteration (e.g. an
+                // offset past a shallow depth limit): their null bestmove
+                // must never outrank a real result by score.
+                if r.depth == 0 {
+                    return;
+                }
                 let mut guard = best.lock().unwrap();
                 let dominated = guard.as_ref().map_or(true, |old| {
                     r.score > old.score || (r.score == old.score && r.depth > old.depth)
@@ -224,7 +358,12 @@ fn report(r: &SearchResult) {
         r.time_ms,
         pv.join(" ")
     ));
-    out(&format!("bestmove {}", r.best.to_uci()));
+    // Terminal positions have no legal move: spec says 0000.
+    if r.best == Move::null() {
+        out("bestmove 0000");
+    } else {
+        out(&format!("bestmove {}", r.best.to_uci()));
+    }
 }
 
 fn parse_position(tokens: &[&str]) -> Position {

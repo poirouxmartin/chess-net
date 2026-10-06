@@ -19,4 +19,6 @@ fn stopped_at_start_returns_sane_root_score() {
     assert!(res.score > -INF, "score must not be uninitialized -INF, got {}", res.score);
     assert!(res.best != Move::null(), "best must be a legal move");
     assert!(res.depth >= 1);
+    assert!(!res.pv.is_empty(), "PV must not be empty: best must be a searched move");
+    assert_eq!(res.pv[0], res.best, "PV must start with the returned best move");
 }

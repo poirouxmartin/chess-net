@@ -303,11 +303,18 @@ impl Searcher {
 
         let mut prev = 0i32;
         for d in start_depth..=max_depth {
+            // Don't START a new depth when stopped (a previous completed
+            // iteration's result stands). The first iteration always runs
+            // so a pre-stopped search still returns a searched move.
+            if stop.load(Ordering::Relaxed) && done > 0 {
+                break;
+            }
             // Aspiration windows from depth 6 on: search around the previous
             // iteration's score. On a fail, re-center the window on the fail
             // score and widen (never fall back to a full window), so the
             // re-search stays narrow and the node cost of a re-search is small.
-            let aspire = d >= 6 && (MATE - prev).abs() > MAX_PLY as i32;
+            // Disabled near mate scores on EITHER side (mated too).
+            let aspire = d >= 6 && prev.abs() < MATE - MAX_PLY as i32;
             let mut delta = 25i32;
             let (mut alpha, mut beta) = if aspire {
                 ((prev - delta).max(-INF), (prev + delta).min(INF))
@@ -331,6 +338,14 @@ impl Searcher {
                 }
                 delta += delta / 2;
             }
+            // A stopped iteration is only published when nothing completed
+            // yet (first iteration always records its first searched move,
+            // so pre-stopped searches stay sane). Otherwise the last
+            // COMPLETED depth stands — a time-up artifact (score 0 from
+            // abort paths) must never overwrite it or outrank it.
+            if stop.load(Ordering::Relaxed) && done > 0 {
+                break;
+            }
             best = r.best;
             score = r.score;
             done = d as i32;
@@ -352,7 +367,9 @@ impl Searcher {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            if (MATE - score).abs() <= 2 {
+            // Mate found (either side mated or mating): the move cannot
+            // improve on mate, stop iterating.
+            if MATE - score.abs() <= 2 {
                 break;
             }
         }
@@ -402,9 +419,9 @@ impl Searcher {
             };
             self.key_hist_len -= 1;
             pos.unmake_move(undo);
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
+            // Record the fully-searched move BEFORE honoring stop: best/score
+            // must always reflect a completed search, never an unsearched
+            // first-ordered move with a fallback eval score and empty PV.
             if s > alpha {
                 alpha = s;
                 best_move = m;
@@ -413,6 +430,9 @@ impl Searcher {
                 let (left, right) = self.pv_table.split_at_mut(1);
                 left[0][1..1 + len].copy_from_slice(&right[0][..len]);
                 self.pv_len[0] = len + 1;
+            }
+            if stop.load(Ordering::Relaxed) {
+                break;
             }
         }
 
@@ -501,6 +521,12 @@ impl Searcher {
         self.nodes += 1;
         #[cfg(feature = "profiling")]
         PROF.negamax.fetch_add(1, Ordering::Relaxed);
+        // Ply cap: fixed-size tables (pv_table, pv_len, key_hist) have
+        // MAX_PLY slots and the move pool MAX_PLY+1. Perpetual lines must
+        // stop here instead of overrunning them.
+        if ply >= MAX_PLY {
+            return eval(pos);
+        }
         // Reset the PV slot first: any early return (time-up, TT cutoff,
         // null-move, RFP, quiescence, mate) leaves `pv_len[ply] == 0` so the
         // parent never copies a stale PV from an unrelated position.
@@ -526,16 +552,22 @@ impl Searcher {
         let tt_move = match if self.use_tt { self.tt.probe(key) } else { None } {
             Some((tt_score, tt_mv, tt_flag, tt_depth)) => {
                 if ply > 0 && tt_depth >= depth {
+                    // Compare the ply-ADJUSTED score: raw stored mate scores
+                    // carry the storing ply's offset (score_to_tt), so
+                    // comparing raw against this ply's window corrupts
+                    // mate-distance cutoffs.
                     match tt_flag {
                         FLAG_EXACT => return Self::score_from_tt(tt_score, ply),
                         FLAG_LOWER => {
-                            if tt_score >= beta {
-                                return Self::score_from_tt(tt_score, ply);
+                            let adj = Self::score_from_tt(tt_score, ply);
+                            if adj >= beta {
+                                return adj;
                             }
                         }
                         FLAG_UPPER => {
-                            if tt_score <= alpha {
-                                return Self::score_from_tt(tt_score, ply);
+                            let adj = Self::score_from_tt(tt_score, ply);
+                            if adj <= alpha {
+                                return adj;
                             }
                         }
                         _ => {}
@@ -557,7 +589,7 @@ impl Searcher {
         let occ_count = pos.occ.count_ones();
         let mut eval_cache = 0i32;
         let mut have_eval = false;
-        if depth >= 3 && !in_check && occ_count > 5 {
+        if depth >= 3 && !in_check && occ_count > 5 && pos.ep.is_none() {
             eval_cache = eval(pos);
             have_eval = true;
             if eval_cache >= beta {
@@ -609,6 +641,7 @@ impl Searcher {
                     eval_cache = eval(pos);
                 }
                 let mut se_best = -INF;
+                let mut verified = false;
                 let verify = in_check
                     || tt_m.is_en_passant()
                     || tt_m.from() == king
@@ -617,13 +650,17 @@ impl Searcher {
                 if verify && !pos.king_safe(us) {
                     pos.unmake_move(undo);
                 } else {
+                    verified = true;
                     self.key_hist[self.key_hist_len] = pos.key;
                     self.key_hist_len += 1;
                     se_best = -self.negamax(pos, se_depth, -(alpha + margin), -(alpha + margin - 1), ply + 1, stop, eval, pool);
                     self.key_hist_len -= 1;
                     pos.unmake_move(undo);
                 }
-                if se_best <= alpha + margin - 1 {
+                // Only a real verification search earns the extension: an
+                // illegal TT move leaves se_best at -INF, which would
+                // otherwise trivially satisfy the condition below.
+                if verified && se_best <= alpha + margin - 1 {
                     se_ext = 1;
                 }
             }
@@ -829,7 +866,9 @@ let mut searched: Option<Move> = None;
             return if in_check { -MATE + ply as i32 } else { 0 };
         }
         if self.use_tt {
-            self.tt.store(key, Self::score_to_tt(best, ply), depth, flag, best_move);
+            // File under the REDUCED depth when IIR fired: the subtree was
+            // searched one ply shallower, so claiming full depth is unsound.
+            self.tt.store(key, Self::score_to_tt(best, ply), iir_depth, flag, best_move);
         }
         best
     }
@@ -847,6 +886,11 @@ let mut searched: Option<Move> = None;
         self.nodes += 1;
         #[cfg(feature = "profiling")]
         PROF.qnode.fetch_add(1, Ordering::Relaxed);
+        // Ply cap (see negamax): quiescence in-check evasions recurse
+        // without any other depth limit.
+        if ply >= MAX_PLY {
+            return eval(pos);
+        }
         // Same PV-slot reset as negamax: a quiescence leaf is never part of a
         // PV, so a stale length from an earlier position must not leak up.
         self.pv_len[ply] = 0;

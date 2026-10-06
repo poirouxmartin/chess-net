@@ -321,45 +321,14 @@ pub fn count_legal(pos: &Position) -> usize {
 }
 
 fn count_castling(pos: &Position, occ: u64, occ_no_king: u64, them: usize) -> usize {
-    let us = pos.side;
-    let (ks_empty, ks_king, ks_right) = if us == WHITE {
-        (bit(5) | bit(6), bit(4) | bit(5) | bit(6), CASTLE_WK)
-    } else {
-        (bit(61) | bit(62), bit(60) | bit(61) | bit(62), CASTLE_BK)
-    };
-    let (qs_empty, qs_king, qs_right) = if us == WHITE {
-        (bit(1) | bit(2) | bit(3), bit(2) | bit(3) | bit(4), CASTLE_WQ)
-    } else {
-        (bit(57) | bit(58) | bit(59), bit(58) | bit(59) | bit(60), CASTLE_BQ)
-    };
+    // Same gate as generation (see castle_available): counts must agree
+    // with generated moves for perft bulk counting.
     let mut n = 0;
-    if pos.castle & ks_right != 0 && occ & ks_empty == 0 {
-        let mut ok = true;
-        let mut b = ks_king;
-        while b != 0 {
-            let s = pop_lsb(&mut b);
-            if pos.square_attacked(s, them, occ_no_king) {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            n += 1;
-        }
+    if castle_available(pos, occ, occ_no_king, them, true) {
+        n += 1;
     }
-    if pos.castle & qs_right != 0 && occ & qs_empty == 0 {
-        let mut ok = true;
-        let mut b = qs_king;
-        while b != 0 {
-            let s = pop_lsb(&mut b);
-            if pos.square_attacked(s, them, occ_no_king) {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            n += 1;
-        }
+    if castle_available(pos, occ, occ_no_king, them, false) {
+        n += 1;
     }
     n
 }
@@ -381,51 +350,58 @@ fn push_simple(list: &mut MoveList, from: usize, to: usize, enemies: u64, pt: us
     list.push(Move::new(from, to, 0, flags).with_piece(pt));
 }
 
+/// Shared castling gate for generate and count paths (they must agree).
+/// Beyond rights/emptiness/safety, requires the king on its home square
+/// and an own rook on the corner: malformed FENs (rights without pieces)
+/// must not yield castle moves that corrupt state on make/unmake.
+fn castle_available(
+    pos: &Position,
+    occ: u64,
+    occ_no_king: u64,
+    them: usize,
+    kingside: bool,
+) -> bool {
+    let us = pos.side;
+    let (empty, king_path, rook_sq, right, from) = if kingside {
+        if us == WHITE {
+            (bit(5) | bit(6), bit(4) | bit(5) | bit(6), 7usize, CASTLE_WK, 4usize)
+        } else {
+            (bit(61) | bit(62), bit(60) | bit(61) | bit(62), 63usize, CASTLE_BK, 60usize)
+        }
+    } else if us == WHITE {
+        (bit(1) | bit(2) | bit(3), bit(2) | bit(3) | bit(4), 0usize, CASTLE_WQ, 4usize)
+    } else {
+        (bit(57) | bit(58) | bit(59), bit(58) | bit(59) | bit(60), 56usize, CASTLE_BQ, 60usize)
+    };
+    if pos.castle & right == 0 || occ & empty != 0 {
+        return false;
+    }
+    if pos.king_sq[us] != from {
+        return false;
+    }
+    if pos.piece_bb(us, ROOK) & bit(rook_sq) == 0 {
+        return false;
+    }
+    let mut b = king_path;
+    while b != 0 {
+        let s = pop_lsb(&mut b);
+        if pos.square_attacked(s, them, occ_no_king) {
+            return false;
+        }
+    }
+    true
+}
+
 fn gen_castling(pos: &Position, list: &mut MoveList, occ: u64, occ_no_king: u64, them: usize) {
     let us = pos.side;
-    let k = pos.king_sq[us];
-    let (ks_empty, ks_king, ks_rook, ks_right, ks_from, ks_to) = if us == WHITE {
-        (bit(5) | bit(6), bit(4) | bit(5) | bit(6), bit(7), CASTLE_WK, 4, 6)
-    } else {
-        (bit(61) | bit(62), bit(60) | bit(61) | bit(62), bit(63), CASTLE_BK, 60, 62)
-    };
-    let (qs_empty, qs_king, qs_rook, qs_right, qs_from, qs_to) = if us == WHITE {
-        (bit(1) | bit(2) | bit(3), bit(2) | bit(3) | bit(4), bit(0), CASTLE_WQ, 4, 2)
-    } else {
-        (bit(57) | bit(58) | bit(59), bit(58) | bit(59) | bit(60), bit(56), CASTLE_BQ, 60, 58)
-    };
-    let _ = ks_rook;
-    let _ = qs_rook;
-
-    if pos.castle & ks_right != 0 && occ & ks_empty == 0 {
-        let mut ok = true;
-        let mut b = ks_king;
-        while b != 0 {
-            let s = pop_lsb(&mut b);
-            if pos.square_attacked(s, them, occ_no_king) {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            list.push(Move::new(ks_from, ks_to, 0, FLAG_CASTLE_KS).with_piece(KING));
-        }
+    let (ks_from, ks_to) = if us == WHITE { (4, 6) } else { (60, 62) };
+    let (qs_from, qs_to) = if us == WHITE { (4, 2) } else { (60, 58) };
+    if castle_available(pos, occ, occ_no_king, them, true) {
+        list.push(Move::new(ks_from, ks_to, 0, FLAG_CASTLE_KS).with_piece(KING));
     }
-    if pos.castle & qs_right != 0 && occ & qs_empty == 0 {
-        let mut ok = true;
-        let mut b = qs_king;
-        while b != 0 {
-            let s = pop_lsb(&mut b);
-            if pos.square_attacked(s, them, occ_no_king) {
-                ok = false;
-                break;
-            }
-        }
-        if ok {
-            list.push(Move::new(qs_from, qs_to, 0, FLAG_CASTLE_QS).with_piece(KING));
-        }
+    if castle_available(pos, occ, occ_no_king, them, false) {
+        list.push(Move::new(qs_from, qs_to, 0, FLAG_CASTLE_QS).with_piece(KING));
     }
-    let _ = k;
 }
 
 /// En passant is legal only if the king is not in check after removing both pawns.
@@ -477,6 +453,11 @@ pub fn generate_pseudo(pos: &Position, captures_only: bool, in_check: bool) -> M
 /// Fills `out` (cleared first) with the pseudo-legal moves. See
 /// `generate_pseudo`. The caller supplies the buffer so the hot search path
 /// reuses a per-ply `MoveList` instead of zeroing a fresh 1 KB array per node.
+///
+/// Contract: never call with (captures_only=true, in_check=true) — in check
+/// the evasions needed are king moves and full replies, which only
+/// captures_only=false provides. Production call shape is always
+/// `generate_pseudo_into(pos, !in_check, in_check, ...)` (quiescence).
 pub fn generate_pseudo_into(pos: &Position, captures_only: bool, in_check: bool, out: &mut MoveList) {
     out.len = 0;
     let us = pos.side;

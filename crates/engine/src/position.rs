@@ -167,9 +167,15 @@ impl Position {
                 }
             }
         }
+        // EP square must sit on the capturable rank (6th for white to
+        // move, 3rd for black); anything else is a malformed FEN and is
+        // dropped instead of hashed into the key.
         let ep = match parts.get(3).copied() {
             Some("-") | None => None,
-            Some(s) => parse_sq_checked(s),
+            Some(s) => parse_sq_checked(s).filter(|&e| {
+                let rank = e / 8;
+                (side == WHITE && rank == 5) || (side == BLACK && rank == 2)
+            }),
         };
         let halfmove = parts.get(4).map_or(0, |s| s.parse().unwrap_or(0));
         let fullmove = parts.get(5).map_or(1, |s| s.parse().unwrap_or(1));
@@ -547,6 +553,9 @@ impl Position {
     }
 
     /// Squares of enemy pieces giving check to the side to move.
+    /// Includes the enemy king (total contract with square_attacked, which
+    /// counts king attacks): kings can never legally stand adjacent, but a
+    /// hostile FEN must not desynchronize the two either.
     pub fn checkers(&self) -> u64 {
         let us = self.side;
         let them = us ^ 1;
@@ -556,6 +565,7 @@ impl Position {
         c |= knight_attacks(k) & self.piece_bb(them, KNIGHT);
         c |= bishop_attacks(k, occ) & (self.piece_bb(them, BISHOP) | self.piece_bb(them, QUEEN));
         c |= rook_attacks(k, occ) & (self.piece_bb(them, ROOK) | self.piece_bb(them, QUEEN));
+        c |= king_attacks(k) & self.piece_bb(them, KING);
         c
     }
 
@@ -624,7 +634,13 @@ impl Position {
     }
 
     /// Make a null move (pass): toggle side, clear ep. Used by null-move pruning.
+    /// INVARIANT: unmake_null cannot restore EP (no Undo slot), so callers
+    /// must never null with ep set (NMP is gated on ep.is_none()).
     pub fn make_null(&mut self) {
+        debug_assert!(
+            self.ep.is_none(),
+            "null with ep set would corrupt key/ep irreversibly"
+        );
         self.key ^= zob().side;
         if let Some(e) = self.ep {
             self.key ^= zob().ep[file_of(e)];
@@ -658,5 +674,79 @@ mod tests {
             pos2.to_fen(),
             "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
         );
+    }
+
+    /// Malformed EP squares are dropped, never hashed.
+    #[test]
+    fn fen_bad_ep_dropped() {
+        crate::init();
+        let bad = Position::from_fen(
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e9 0 1",
+        );
+        assert_eq!(bad.ep, None);
+        let wrong_rank = Position::from_fen(
+            "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e3 0 1",
+        );
+        assert_eq!(wrong_rank.ep, None);
+        let good = Position::from_fen(
+            "rnbqkbnr/pppp1ppp/8/4pP2/8/8/PPPPP1PP/RNBQKBNR w KQkq e6 0 1",
+        );
+        assert_eq!(good.ep, Some(44));
+    }
+
+    /// make/unmake key identity fuzz: every legal move must round-trip the
+    /// key exactly (catches any make/unmake drift, e.g. EP/castle/rights).
+    #[test]
+    fn make_unmake_key_identity() {
+        use crate::movegen::generate_legal;
+        crate::init();
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            "4k3/8/8/3pP3/8/8/8/4K3 w - d6 0 1",
+            "r3k2r/Pppp1ppp/1b3nbN/1p2p3/2B1P3/1P1P1P1P/RN1QKBNR w KQkq - 0 1",
+        ];
+        for fen in fens {
+            let mut pos = Position::from_fen(fen);
+            let legal = generate_legal(&pos);
+            assert!(legal.len > 0, "test position has no moves: {fen}");
+            for i in 0..legal.len {
+                let m = legal.moves[i];
+                let before = pos.key;
+                let undo = pos.make_move(m);
+                // Play one reply too (covers EP creation/consumption).
+                let legal2 = generate_legal(&pos);
+                if legal2.len > 0 {
+                    let m2 = legal2.moves[0];
+                    let mid = pos.key;
+                    let undo2 = pos.make_move(m2);
+                    pos.unmake_move(undo2);
+                    assert_eq!(pos.key, mid, "reply key drift {fen} {}", m.to_uci());
+                }
+                pos.unmake_move(undo);
+                assert_eq!(pos.key, before, "key drift {fen} {}", m.to_uci());
+            }
+        }
+    }
+
+    /// Rook captures on home squares must erode rights (and round-trip).
+    #[test]
+    fn rook_capture_erodes_rights() {
+        use crate::movegen::generate_legal;
+        crate::init();
+        let mut pos = Position::from_fen(
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+        );
+        assert_eq!(pos.castle, 15);
+        let legal = generate_legal(&pos);
+        let cap = legal.moves[..legal.len]
+            .iter()
+            .find(|m| m.to_uci() == "a1a8")
+            .copied()
+            .expect("Rxa8+ must be legal");
+        let undo = pos.make_move(cap);
+        assert_eq!(pos.castle & CASTLE_BQ, 0, "a8 rook gone: BQ eroded");
+        pos.unmake_move(undo);
+        assert_eq!(pos.castle, 15, "rights restored");
     }
 }

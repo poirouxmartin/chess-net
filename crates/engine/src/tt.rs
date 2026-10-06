@@ -49,9 +49,16 @@ impl TT {
     pub fn probe(&self, key: u64) -> Option<(i32, Move, u8, i32)> {
         let idx = (key as usize) & self.mask;
         let e = &self.entries[idx];
-        let k = e.key.load(Ordering::Relaxed);
+        // Acquire pairs with the Release key-store below: a matching key
+        // implies the data store (sequenced before it) is visible.
+        let k = e.key.load(Ordering::Acquire);
         if k == key {
             let mv = e.mv.load(Ordering::Relaxed);
+            // Re-verify: a concurrent store could have swapped the slot
+            // between the two loads (torn read). Discard on any change.
+            if e.key.load(Ordering::Acquire) != key {
+                return None;
+            }
             let score = (mv >> 32) as i32;
             let raw_mv = (mv & 0x1F_FFFF) as u32;
             let depth = ((mv >> 21) & 0xFF) as i32 - 128;
@@ -74,8 +81,10 @@ impl TT {
             | ((score as u32 as u64) << 32);
         // Always replace on key match, deeper entry, or empty slot.
         if e.key.load(Ordering::Relaxed) == key || depth > old_depth || old_depth < 0 {
-            e.key.store(key, Ordering::Relaxed);
+            // Data first, key last with Release: readers that Acquire-load
+            // this key are guaranteed to see the matching data.
             e.mv.store(new_mv, Ordering::Relaxed);
+            e.key.store(key, Ordering::Release);
         }
     }
 

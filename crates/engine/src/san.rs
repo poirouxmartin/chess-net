@@ -6,6 +6,11 @@ use crate::position::{BISHOP, KING, KNIGHT, Position, QUEEN, ROOK};
 
 /// SAN text for `m` played from `pos` (e.g. "Nf3", "exd5", "O-O-O+", "e8=Q#").
 pub fn to_san(pos: &Position, m: Move) -> String {
+    let legal = generate_legal(pos);
+    if !legal.moves[..legal.len].iter().any(|lm| lm.0 == m.0) {
+        return format!("?({})", m.to_uci());
+    }
+
     if m.is_castle() {
         let mut s = if m.flags() == FLAG_CASTLE_QS { "O-O-O" } else { "O-O" }.to_string();
         s.push_str(&check_suffix(pos, m));
@@ -85,6 +90,11 @@ fn disambiguation(pos: &Position, m: Move, pt: usize) -> String {
 
 fn check_suffix(pos: &Position, m: Move) -> String {
     let mut p = *pos;
+    let legal = generate_legal(pos);
+    let is_legal = legal.moves[..legal.len].iter().any(|lm| lm.0 == m.0);
+    if !is_legal {
+        return String::new();
+    }
     p.make_move(m);
     if !p.in_check() {
         return String::new();

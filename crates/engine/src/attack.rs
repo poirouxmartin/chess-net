@@ -49,7 +49,8 @@ pub struct Attacks {
     pub pawn: [[u64; 64]; 2],
     /// Strictly between two squares (0 when not aligned).
     pub between: [[u64; 64]; 64],
-    /// Full line through two aligned squares (including both endpoints).
+    /// Full line through two aligned squares, extending in both directions
+    /// (includes `b` and beyond, but NOT `a` itself).
     pub line: [[u64; 64]; 64],
 }
 
