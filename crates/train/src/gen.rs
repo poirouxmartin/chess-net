@@ -84,8 +84,7 @@ fn play_game(rng: &mut Rng, search: &mut MctsSearch, opts: &GenOptions, feat: u3
             Some(m) => m,
             None => break,
         };
-        search.keep_child(mv);
-        pos.make_move(mv);
+        search.keep_child(mv, { pos.make_move(mv); pos.key });
     }
 
     // White POV result for the whole game.

@@ -1,4 +1,10 @@
 //! Supervised training loop: shuffle, minibatches, Adam, periodic export.
+//!
+//! LEGACY track: unflipped from*64+to 4096 policy mapping (see data.rs).
+//! The active pipeline is the Python AlphaZero loop (python/chessnet),
+//! which uses STM-oriented 4288 indices. Nets trained here are NOT
+//! compatible with the current engine policy mapping (their policy head
+//! is ignored: engine requires policy_size == 4288).
 
 use crate::data::Sample;
 use crate::net::TrainNet;
@@ -20,7 +26,15 @@ pub fn train(samples: &[Sample], opts: &TrainOptions) -> Result<TrainNet, String
         TrainNet::init(2, 768, 256, 32, 4096, &mut Rng::new(opts.seed))
     } else {
         nn::load(&opts.init_net)?;
-        let net = TrainNet::from_nn(nn::loaded().expect("net loaded"));
+        let loaded = nn::loaded().expect("net loaded");
+        if loaded.policy_size != 4096 {
+            return Err(format!(
+                "init net has policy_size {} (want 4096): this legacy trainer uses the \
+                 unflipped from*64+to mapping; v1 (value-only) and 4288 nets are rejected",
+                loaded.policy_size
+            ));
+        }
+        let net = TrainNet::from_nn(&loaded);
         println!(
             "loaded {} (feat={}, {}->{}->{}, policy={})",
             opts.init_net, net.feat, net.feat_count, net.l0, net.l1, net.policy_size
@@ -30,6 +44,30 @@ pub fn train(samples: &[Sample], opts: &TrainOptions) -> Result<TrainNet, String
     if opts.batch_size == 0 || samples.is_empty() {
         return Err("need samples and a non-zero batch size".to_string());
     }
+    // Trust boundary: the .bin format carries no feat_count, so validate
+    // indices against this net (OOB would panic in forward/backward) and
+    // drop non-finite/out-of-range results (BCE poison).
+    let feat_count = net.feat_count;
+    let kept: Vec<Sample> = samples
+        .iter()
+        .filter(|s| {
+            s.result.is_finite()
+                && (0.0..=1.0).contains(&s.result)
+                && s.active.iter().all(|&f| (f as usize) < feat_count)
+        })
+        .cloned()
+        .collect();
+    if kept.len() < samples.len() {
+        println!(
+            "filtered {}/{} corrupt samples (bad features/result)",
+            samples.len() - kept.len(),
+            samples.len()
+        );
+    }
+    if kept.is_empty() {
+        return Err("no valid samples after filtering".to_string());
+    }
+    let samples = &kept[..];
 
     let mut idx: Vec<usize> = (0..samples.len()).collect();
     let mut rng = Rng::new(opts.seed ^ 0xabcdef);

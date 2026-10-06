@@ -60,6 +60,9 @@ pub fn read_samples(path: &str) -> Result<Vec<Sample>, String> {
         return Err(format!("unsupported CHSP version: {}", version));
     }
     let count = read_u32(&mut r)?;
+    if count > 10_000_000 {
+        return Err(format!("absurd sample count: {}", count));
+    }
     let mut samples = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let n_active = read_u32(&mut r)? as usize;
